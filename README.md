@@ -22,6 +22,15 @@ their claimed interfaces and any suspect claims, before a driver touches them.
 
 Every kernel change is reversed on exit, including Ctrl-C, SIGTERM and SIGHUP.
 
+![usbairlock holding two devices and recording what a keyboard typed](docs/usbairlock.png)
+
+A real `--paranoid --auto` run. Both devices are held `UNAUTHORIZED`, so the kernel
+created no interface objects and nothing could bind, yet the descriptors below each one
+were still read over control transfers: manufacturer, product, serial, and every
+interface the device claims. The keyboard scores `HIGH` on a boot-protocol claim, and the
+last two lines are what it typed, read straight off the endpoint. None of it reached the
+session.
+
 ## what it does that blocking alone does not
 
 A device that claims to be a keyboard can be refused. That tells you it is hostile. It does
