@@ -229,7 +229,8 @@ Read `notes/threat-model.md`. The short version: this fully covers the BadUSB an
 Ducky class, because that attack has to declare itself in a descriptor before it can act.
 It **cannot** see a USB killer, which finishes in microseconds with no enumeration, and it
 cannot tell a charge-only cable from an empty port, because both produce the same absence
-of any event. Those are physical layer and want the inline hardware tier in `hardware/`.
+of any event. Those are physical layer and want an inline hardware tier, which is planned and not
+written yet.
 
 ## two executables, on purpose
 
@@ -298,7 +299,7 @@ paths, including the BadUSB and Rubber Ducky shapes, without owning either.
 
 Once a device is admitted the question stops being whether it is hostile and becomes what
 it is. Nothing below detects threats. A board's silicon says nothing about its intent, and
-`rules.py` judges claimed interface classes, never chips: a Rubber Ducky is usually some
+`airlock/rules.py` judges claimed interface classes, never chips: a Rubber Ducky is usually some
 anonymous ATtiny, and a Pico is not dangerous by virtue of being a Pico. This is ordinary
 hardware triage, kept here because it is the other half of the same bench session.
 

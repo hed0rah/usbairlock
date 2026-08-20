@@ -107,7 +107,7 @@ def main():
     ports=[a for a in args if a.startswith("/dev/")]
     if not ports: ports=sorted(glob.glob("/dev/ttyACM*")+glob.glob("/dev/ttyUSB*"))
     if not ports:
-        print(f"  {Y}no serial port. run ./tools/enumerate first.{N}")
+        print(f"  {Y}no serial port. run ./usbairlock --inspect first.{N}")
         print(f"  {D}for a Pico in BOOTSEL there is no port: use --rp2040{N}")
         return 1
     print(f"  {B}dumping from {ports[0]}{N}  {D}(read-only, nothing is written to the device){N}")

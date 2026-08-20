@@ -10,7 +10,7 @@ is worse than no tool.
 
 ## the two tiers
 
-| | software tier (this repo) | hardware tier (planned, `hardware/`) |
+| | software tier (this repo) | hardware tier (planned, not written) |
 | --- | --- | --- |
 | position | on the exposed host | inline, between device and host |
 | sees | descriptors, claimed classes, driver binds | volts, amps, D+/D- continuity, timing |

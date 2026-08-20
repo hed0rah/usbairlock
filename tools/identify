@@ -151,7 +151,7 @@ def main():
 
     if not found:
         print(f"  {Y}nothing identified.{N}")
-        print(f"  {D}if no serial port appeared at all, this is step 1 not step 2: run ./tools/enumerate{N}")
+        print(f"  {D}if no serial port appeared at all, this is step 1 not step 2: run ./usbairlock --inspect{N}")
         print(f"  {D}if a port exists but nothing answers, hold BOOT and tap RESET, then retry{N}")
         report_tools()
         return 1
