@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """usbairlock -- it shows you things... horrible things
 
-    sudo ./usbairlock --auto             the usual run: hold the door, record what types
+    sudo ./usbairlock --auto             the usual run: withhold arrivals, record what types
     sudo ./usbairlock --auto -q          same, but trust and hide what is already plugged in
-    sudo ./usbairlock                    hold the door and watch, no recording
+    sudo ./usbairlock                    withhold and watch, no recording
     ./usbairlock --observe               watch only, change nothing, no root needed
     sudo ./usbairlock --paranoid --auto  every protection on, plus recording
     ./usbairlock --status                what is protected right now, then exit
     ./usbairlock --diagnose              nothing appeared, why not
     ./usbairlock --write-config          print a config file to stdout
 
+One monitor runs at a time. A second one is refused rather than allowed to fight it over
+the same kernel settings. From any other terminal:
+
+    sudo ./usbairlock --attach           watch the running monitor, read-only
+    sudo ./usbairlock --authorize VID:PID  admit a device, and tell the monitor to trust it
+
 Every protection is reversible and is restored when this exits, including on Ctrl-C
 or a kill.
 """
-import argparse, glob, os, queue, re, sys, threading, time
+import argparse, glob, os, queue, re, signal, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from airlock import config as cfgmod, protect, usbinfo, capture as capmod, live as livemod
+from airlock import ipc
 
 C = dict(R="\033[31m", G="\033[32m", Y="\033[33m", B="\033[34m", C="\033[36m",
          M="\033[35m", D="\033[2m", W="\033[1m", N="\033[0m")
@@ -315,6 +322,43 @@ def do_status():
         show_device(meta["id"], meta["name"], {"monitor":{"descriptors":"summary"}})
     return 0
 
+def do_attach(a):
+    """Watch a monitor that is already running, without touching a single kernel knob."""
+    pid = ipc.holder_pid()
+    if not pid:
+        p(f"  {C['Y']}no monitor is running{C['N']}")
+        p(f"  {C['D']}start one with: sudo ./usbairlock --auto{C['N']}")
+        return 1
+    if not protect.is_root():
+        p(f"  {C['R']}--attach needs root{C['N']}")
+        # Not an arbitrary restriction. The stream replays captured HID reports.
+        p(f"  {C['D']}the stream carries captured keystrokes, so the socket is root-only{C['N']}")
+        return 1
+    p(f"  {C['W']}attached{C['N']} {C['D']}to monitor pid {pid}, read-only.{C['N']}")
+    p(f"  {C['D']}ctrl-c detaches. the monitor keeps running and keeps holding.{C['N']}")
+    rule()
+    rc = 0
+    with livemod.Pinned(height=5, enabled=not a.plain) as pin:
+        out = pin.log if pin.enabled else _p
+        def on_event(ev):
+            kind = ev.get("ev")
+            if kind == "log":
+                out(ev.get("line", ""))
+            elif kind == "status" and pin.enabled:
+                pin.set(list(ev.get("lines") or []))
+        try:
+            rc = ipc.attach(on_event)
+            gone = True
+        except KeyboardInterrupt:
+            gone = False
+        except OSError as e:
+            p(f"  {C['R']}could not attach: {e}{C['N']}")
+            return 1
+    p(f"  {C['D']}" + ("the monitor exited." if gone else "detached, monitor still running.")
+      + f"{C['N']}")
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--config"); ap.add_argument("--observe", action="store_true")
@@ -348,6 +392,10 @@ def main():
                     help="no pinned status block, just scrolling output")
     ap.add_argument("--porcelain", action="store_true",
                     help="stable tab-separated records for scripts, no colour or layout")
+    ap.add_argument("--attach", action="store_true",
+                    help="watch a monitor that is already running, read-only")
+    ap.add_argument("--force", action="store_true",
+                    help="start a second monitor anyway, even though one holds the lock")
     ap.add_argument("-h","--help", action="store_true")
     for name in protect.REGISTRY:
         flag = name.replace("_","-")
@@ -374,13 +422,48 @@ def main():
         if not protect.is_root(): p(f"  {C['R']}--authorize needs root{C['N']}"); return 1
         done = protect.authorize(a.authorize)
         p(f"  authorized {len(done)} device(s): {' '.join(done) or 'none matched'}")
+        # Authorising writes sysfs, which a running monitor sees on its next poll.
+        # The ALLOW LIST is separate: it is policy, and without recording it there the
+        # monitor would withhold this same device again on the next replug.
+        if done and ipc.append_allow([a.authorize]):
+            pid = ipc.holder_pid()
+            p(f"  {C['D']}added to the shared allow list"
+              + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
+              + f"{C['N']}")
         return 0 if done else 1
+    if a.attach: return do_attach(a)
     if a.status: return do_status()
     if a.diagnose: return do_diagnose()
     if a.disarm: return do_arm(cfg, disarm=True)
     if a.arm: return do_arm(cfg)
     if a.inspect: return do_inspect(cfg, None if a.inspect is True else a.inspect)
     if a.capture: return do_capture(cfg, a.capture, a.iface, a.endpoint, None)
+
+    # SINGLE INSTANCE. Two monitors would both apply protections and both register
+    # cleanup handlers over the same sysfs knobs, so whichever exits first restores them
+    # while the other still believes it is holding. Nothing reports that, and it leaves
+    # the machine in exactly the state this tool exists to prevent.
+    # SIGUSR1 asks us to re-read the allow list now rather than on the next tick. The
+    # handler goes in BEFORE the lock, because acquire() publishes our pid and the
+    # default action for SIGUSR1 is to terminate. An --authorize landing in the gap
+    # between publishing the pid and installing the handler would kill the monitor and
+    # lift the gate, which is the one failure this whole file is meant to prevent.
+    reread = [False]
+    def _on_usr1(signum=None, frame=None): reread[0] = True    # set a flag, nothing more
+    try: signal.signal(signal.SIGUSR1, _on_usr1)
+    except (OSError, ValueError): pass
+
+    holder = ipc.Holder()
+    if not holder.acquire():
+        other = ipc.holder_pid()
+        where = f" {C['D']}(pid {other}){C['N']}" if other and other > 0 else ""
+        if not a.force:
+            p(f"  {C['R']}a monitor is already running{C['N']}{where}")
+            p(f"  {C['D']}watch it:  sudo ./usbairlock --attach{C['N']}")
+            p(f"  {C['D']}override:  --force, only if you are sure the other one is wedged{C['N']}")
+            return 1
+        p(f"  {C['Y']}--force: starting a second monitor while another holds the lock{where}.{C['N']}")
+        p(f"  {C['Y']}whichever exits first restores the shared kernel settings for both.{C['N']}")
 
     # Tell the protection layer what to leave alone before it unbinds anything.
     _snap0 = usbinfo.snapshot()
@@ -389,6 +472,8 @@ def main():
     results = protect.apply(cfg["protections"]) if not a.observe else \
               [(n, False, None, d) for n,(f,d) in protect.REGISTRY.items()]
     protect.install_handlers(lambda n: p(f"\n  {C['D']}restored {n} kernel setting(s).{C['N']}"))
+    holder.serve()
+    protect.add_cleanup(holder.close)
 
     if a.porcelain:
         for name, wanted, ok, detail in results:
@@ -411,6 +496,11 @@ def main():
     if a.allow_existing or a.quiet:
         allow |= set(m["id"] for m in seen.values())
     hide_allowed = a.hide_allowed or a.quiet
+    # The shared allow list lives in /run and is re-read every tick, so an --authorize
+    # run in another terminal lands here without restarting the monitor. SIGUSR1 only
+    # makes that happen immediately instead of within one poll interval.
+    allow |= ipc.read_allow()
+    allow_stamp = [ipc.allow_mtime()]
 
     shown = 0
     for k, m in sorted(seen.items()):
@@ -439,29 +529,46 @@ def main():
     # Keystrokes arrive one report at a time but read as a sentence. Buffer per device
     # and flush on a newline or a pause, so a payload prints as the line it typed.
     active = [n for n, w, ok, _ in results if w and ok]
+    gating = any(n in ("withhold_device", "withhold_interface") for n in active)
 
     # A pinned block below a normal scrolling region, the apt / docker-pull shape.
     # Not a full-screen TUI on purpose: scrollback survives and the log stays copyable.
     with livemod.Pinned(height=5, enabled=not a.plain) as pin:
-        emit = pin.log if pin.enabled else _p
+        # Every user-visible line already funnels through emit, so wrapping it once is
+        # the whole broadcast layer. Viewers see exactly what the holder's terminal sees.
+        emit = ipc.tee(pin.log if pin.enabled else _p, holder)
+        last_status = []
 
         def status(last=""):
-            if not pin.enabled: return
             gate = (f"{C['G']}WITHHELD{C['N']} " + ", ".join(active)) if active \
                    else f"{C['Y']}GRANTED{C['N']}  drivers bind normally"
-            pin.set([
+            watching = f"   viewers {holder.viewers}" if holder.viewers else ""
+            lines = [
                 C["D"] + "-" * 76 + C["N"],
                 f" {C['W']}usbairlock{C['N']}   {gate}",
                 f" devices {len(seen):<3} arrived {counts['arrived']:<3} "
                 f"{C['R']}high {counts['high']}{C['N']}  {C['Y']}med {counts['med']}{C['N']}"
-                f"   serial {len(prev_serial)}   up {int(time.time()-started)}s",
+                f"   serial {len(prev_serial)}   up {int(time.time()-started)}s{watching}",
                 f" {C['D']}{last[:72]}{C['N']}",
                 f" {C['D']}ctrl-c stops and restores every kernel change{C['N']}",
-            ])
+            ]
+            last_status[:] = lines
+            if pin.enabled: pin.set(lines)
+            holder.broadcast("status", lines=lines)
         status("waiting for a device")
 
         while True:
             time.sleep(interval)
+            holder.pump(hello={"ev": "status", "lines": last_status} if last_status else None)
+            if reread[0] or ipc.allow_mtime() != allow_stamp[0]:
+                reread[0], allow_stamp[0] = False, ipc.allow_mtime()
+                fresh = ipc.read_allow() - allow
+                if fresh:
+                    allow |= fresh
+                    protect.SKIP |= fresh     # so a replug is not withheld again
+                    emit(f"  {time.strftime('%H:%M:%S')}  {C['G']}+ allowed{C['N']}  "
+                         f"{' '.join(sorted(fresh))}  {C['D']}another process authorized this{C['N']}")
+                    status(f"allow list now {len(allow)} device(s)")
             now = usbinfo.snapshot()
             for k in sorted(set(now) - set(seen)):
                 vp0 = now[k]["id"]
@@ -483,6 +590,14 @@ def main():
                 if "HIGH" in lv: counts["high"] += 1
                 elif "MED" in lv: counts["med"] += 1
                 vp = now[k]["id"]
+                # Independent of the branch below, deliberately. This device enumerated
+                # unauthorized because our gate was down, and the kernel copies
+                # authorized_default in once, at enumeration time, so restoring the gate
+                # on exit will not revive it. Record it now or it stays dead after we
+                # quit. Folding this into the elif chain below would also stop --auto
+                # ever reaching its capture branch.
+                if gating and now[k].get("authorized") == "0":
+                    protect.note_withheld(now[k].get("sysfs"))
                 if vp in allow:
                     emit(f"                 {C['D']}on the allow list, left alone{C['N']}")
                 elif a.auto and _hid_interfaces(d) and vp not in capturing:

@@ -106,6 +106,71 @@ Related: `--auto` does not remove `usbhid` globally. It authorizes the target in
 unbinds the driver **from that interface only**, so every other HID device keeps working,
 and rebinds on exit.
 
+The same lockout has a back door that is easy to miss. The kernel copies
+`authorized_default` into a device's own `authorized` **once, at enumeration time**, so a
+device plugged in mid-session is stuck at `authorized=0` and putting the gate back on exit
+does not revive it. It stays dead until it is physically replugged. Anything withheld while
+the gate was down is therefore re-authorized on exit, and only that: a device someone
+deauthorized for their own reasons is left alone.
+
+## one monitor, many terminals
+
+Two monitors running at once would both apply protections and both register cleanup
+handlers over the same sysfs knobs, so whichever exited first would restore them while
+the other still believed it was holding. Nothing reported that, and it left the machine
+in exactly the state the tool exists to prevent. A second monitor is now refused:
+
+```
+$ sudo ./usbairlock --auto
+  a monitor is already running (pid 1836045)
+  watch it:  sudo ./usbairlock --attach
+  override:  --force, only if you are sure the other one is wedged
+```
+
+`--attach` opens a read-only view of the running monitor. It sees the same arrivals,
+threat lines and captured keystrokes, and it touches nothing: detaching leaves the
+monitor holding. `--authorize` from a third terminal admits a device and the monitor
+picks it up within a tick.
+
+```
+term 1 $ sudo ./usbairlock --auto
+term 2 $ sudo ./usbairlock --attach
+term 3 $ sudo ./usbairlock --authorize 303a:1001
+         authorized 1 device(s): 1-2
+         added to the shared allow list, monitor pid 1836045 notified
+
+term 1 + allowed  303a:1001  another process authorized this      <- both terminals
+term 2 + allowed  303a:1001  another process authorized this
+```
+
+Authorizing writes sysfs, which the monitor would see anyway on its next poll. Recording
+it in the shared allow list is the separate half: without that the monitor would withhold
+the same device again on the next replug.
+
+State lives in three files under `/run/usbairlock`, which is tmpfs, so all of it is
+per-boot:
+
+| file | what it is |
+| --- | --- |
+| `lock` | `flock` held for the monitor's lifetime, and its pid |
+| `allow` | one `vid:pid` per line, re-read every tick |
+| `sock` | newline-delimited JSON, one event per line |
+
+Two things that are deliberate. **The socket is root-only, 0600 inside a 0700
+directory**, because the stream replays captured HID reports: a viewer channel anyone
+could open would turn this into a keylogger with a published socket. And **IPC never
+breaks protection**. A read-only filesystem, a stale socket, a viewer that stops reading:
+each degrades to a note and the monitor keeps holding. A viewer that stalls past a
+megabyte of backlog is dropped rather than allowed to block the poll loop.
+
+`/run` being tmpfs also draws a line worth keeping: `--authorize` means *trust this until
+reboot*, while the config file means *trust this always*. Neither silently becomes the
+other.
+
+The event stream is the seam a daemon mode would grow from. It is already a versioned
+line protocol rather than a private format, so a future `--daemon` and a richer client
+would not need to change what the monitor emits.
+
 ## the display
 
 Output is a normal scrolling log with a **pinned status block** at the bottom, the shape
@@ -156,8 +221,8 @@ of any event. Those are physical layer and want the inline hardware tier in `har
 
 | | lines | needs | for |
 | --- | --- | --- | --- |
-| `airlock-min` | 149 | python3, one file | any box, no install, drop and run |
-| `usbairlock` | ~1100 | python3 stdlib | the full thing: protections, capture, config |
+| `airlock-min` | 154 | python3, one file | any box, no install, drop and run |
+| `usbairlock` | ~1900 | python3 stdlib | the full thing: protections, capture, config |
 
 **`airlock-min` is the whole idea in one file.** Reads sysfs directly, assesses the
 claims, watches for arrivals, and optionally holds the gates. No package, no config, no
@@ -183,7 +248,8 @@ tables. Everything Linux-specific lives elsewhere.
 | `./usbairlock --inspect [VID:PID]` | one-shot: what is attached and what it claims |
 | `./usbairlock --diagnose` | nothing appeared. Why not |
 | `sudo ./usbairlock --arm` / `--disarm` | apply or release protections and exit, persistently |
-| `sudo ./usbairlock --allow VID:PID` | let one device bind |
+| `sudo ./usbairlock --authorize VID:PID` | admit one device, and share that decision with a running monitor |
+| `sudo ./usbairlock --attach` | read-only view of a monitor already running elsewhere |
 | `./usbairlock --write-config` | print a config file |
 
 Exit status of `--inspect` is 2 when anything scored HIGH, so it drops into a script.
@@ -204,7 +270,9 @@ install them.
 ## tests
 
 ```sh
-python3 tests/test_threats.py
+python3 tests/test_threats.py     # threat assessment, synthetic descriptors
+python3 tests/test_ipc.py         # lock, shared allow list, viewer channel
+python3 tests/test_restore.py     # what exit puts back, including the lockout regression
 ```
 
 No pytest, no dependencies. These exist because the detector had never fired on real
@@ -237,10 +305,11 @@ device class **before** the kernel binds a driver. See `notes/threat-model.md`.
 ## layout
 
     usbairlock   the app
-    airlock/     rules (portable, zero imports), protections, device analysis, live display
+    airlock/     rules (portable, zero imports), protections, device analysis, live
+                 display, and the lock / allow list / viewer channel in ipc.py
     airlock-min  the whole idea in one file, for a box with nothing installed
     tools/       identify and dump: the post-airlock hardware step
-    tests/       threat detection tests
+    tests/       threat detection and ipc tests
     notes/     per-family reference and the threat model
     dumps/     firmware read out of boards, gitignored (they can be large, and they are
                not ours to redistribute)

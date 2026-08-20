@@ -140,9 +140,14 @@ def apply(cfg_protections):
         if ok: _applied.append(name)
     return results
 
+WITHHELD = set()      # sysfs device dirs that enumerated while our gate was down
+
+def note_withheld(sysfs):
+    """Record a device that arrived unauthorized because of us, so exit can revive it."""
+    if sysfs: WITHHELD.add(sysfs)
+
 def restore_all():
     """Put every touched sysfs value back. Registered with atexit and signals."""
-    if not _saved: return 0
     n = 0
     for path, val in list(_saved.items()):
         try:
@@ -150,6 +155,21 @@ def restore_all():
         except Exception:
             pass
     _saved.clear()
+    # Restoring the gate does NOT revive anything that arrived while it was down. The
+    # kernel copies authorized_default into a device's `authorized` once, at enumeration
+    # time, so a device admitted under a closed gate stays at authorized=0 forever and
+    # its interfaces never appear. Putting the default back changes nothing for it.
+    #
+    # That is the lockout this tool exists to prevent, arriving by the back door: plug a
+    # keyboard in mid-session, exit cleanly, and the keyboard is dead until it is
+    # physically replugged. So re-authorize exactly the devices we withheld, and no
+    # others: a device someone else deauthorized on purpose is not ours to touch.
+    for sysfs in sorted(WITHHELD):
+        try:
+            if authorize(path=sysfs): n += 1
+        except Exception:
+            pass
+    WITHHELD.clear()
     return n
 
 _cleanups = []
