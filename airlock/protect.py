@@ -215,7 +215,17 @@ def authorize(vid_pid=None, path=None, interfaces=True):
     So after authorising, ask the bus to re-run driver matching for each interface.
     """
     done = []
-    for d in glob.glob("/sys/bus/usb/devices/*/"):
+    # `path` narrows this to ONE device. Without honouring it, a caller passing only a
+    # path gets vid_pid=None, the filter below never fires, and this authorises every
+    # device on the bus and re-probes every interface. restore_all() calls it exactly
+    # that way to revive what the gate withheld, so the bug turned a targeted revival
+    # into switching the whole bus back on, including devices someone deauthorised on
+    # purpose.
+    if path:
+        cands = [path if path.endswith("/") else path + "/"]
+    else:
+        cands = glob.glob("/sys/bus/usb/devices/*/")
+    for d in cands:
         if not os.path.exists(os.path.join(d, "idVendor")): continue
         vp = f"{_read(os.path.join(d,'idVendor'))}:{_read(os.path.join(d,'idProduct'))}"
         if vid_pid and vp != vid_pid: continue

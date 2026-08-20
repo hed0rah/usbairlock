@@ -7,7 +7,7 @@ authorized_default into a device's `authorized` once, at enumeration time. Plug 
 keyboard in mid-session, exit cleanly, and the keyboard stayed dead until it was
 physically replugged. The tool had shipped that.
 """
-import os, sys
+import os, shutil, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from airlock import protect                                 # noqa: E402
@@ -26,6 +26,7 @@ def check(name, got, want):
 def main():
     print()
     authorized = []
+    _real_authorize = protect.authorize
     protect.authorize = lambda vid_pid=None, path=None, interfaces=True: (
         authorized.append(path or vid_pid) or ["stub"])
 
@@ -61,6 +62,36 @@ def main():
 
     check("note_withheld ignores a missing sysfs path",
           (protect.note_withheld(None), protect.WITHHELD)[1], set())
+
+    # -- authorize() actually honours path ---------------------------------------
+    # The tests above stub authorize, which is why they did not catch this: the real
+    # function accepted path= and ignored it, so restore_all(path=X) fell through to
+    # globbing the whole bus and switched every device on. A stub verifies the call,
+    # never the behaviour. This drives the real function against a fake sysfs tree.
+    protect.authorize = _real_authorize
+    tmp = tempfile.mkdtemp(prefix="usbairlock-restore-")
+    try:
+        made = []
+        for name, vid in (("1-2", "303a"), ("1-9", "dead")):
+            d = os.path.join(tmp, name)
+            os.makedirs(d)
+            open(os.path.join(d, "idVendor"), "w").write(vid)
+            open(os.path.join(d, "idProduct"), "w").write("0001")
+            open(os.path.join(d, "authorized"), "w").write("0")
+            made.append(d)
+        target, bystander = made
+        got = protect.authorize(path=target)
+
+        def auth_of(d):
+            return open(os.path.join(d, "authorized")).read().strip()
+
+        check("authorize(path=) returns just that device", got, ["1-2"])
+        check("authorize(path=) switches the target on", auth_of(target), "1")
+        check("authorize(path=) leaves every other device alone", auth_of(bystander), "0")
+        check("a path that is not a device authorizes nothing",
+              protect.authorize(path=os.path.join(tmp, "nope")), [])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     ok = sum(_results)
     print(f"\n  {ok} passed, {len(_results) - ok} failed\n")
