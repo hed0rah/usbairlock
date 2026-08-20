@@ -57,13 +57,35 @@ class Pinned:
         self._cols, self._rows = cols, max(rows, self.height + 4)
 
     # -- use ------------------------------------------------------------------
+    def _sync(self):
+        """Re-establish the scroll region if the terminal changed size.
+
+        A font change or a window resize alters the row count, and the old DECSTBM
+        region no longer matches the screen. The cursor is then parked below the new
+        region, inside the pinned block, so everything log() writes lands in the pinned
+        area and paint() overwrites it on the same tick. Output looks like it stopped
+        dead while the status block carries on updating, which reads as a hung tool.
+
+        No SIGWINCH handler on purpose: the monitor repaints the status every poll tick,
+        so checking the size here corrects it within one interval without doing terminal
+        writes from inside a signal handler.
+        """
+        prev = self._rows
+        self._size()
+        if self._rows != prev and self._active:
+            sys.stdout.write(f"\033[1;{self._rows - self.height}r")
+            sys.stdout.write(f"\033[{self._rows - self.height};1H")
+            sys.stdout.flush()
+
     def log(self, text=""):
         """Print into the scrolling region, then repaint the pinned block."""
+        self._sync()
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
         self.paint()
 
     def set(self, lines):
+        self._sync()
         self.lines = lines
         self.paint()
 
