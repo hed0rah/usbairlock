@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""identify -- work out what chip is actually on the other end.
+
+    ./tools/identify                  try everything attached
+    ./tools/identify /dev/ttyACM0     one port
+    ./tools/identify --tools          just report which backends are installed
+
+Step 2 of the airlock cycle. The silkscreen lies, the seller's listing lies, and the
+USB product string is whatever the vendor typed. This asks the silicon.
+
+Nothing here writes to the device. Reading a chip ID does not modify flash.
+"""
+import glob, os, re, shutil, subprocess, sys
+
+G="\033[32m"; Y="\033[33m"; R="\033[31m"; D="\033[2m"; B="\033[1m"; N="\033[0m"
+
+BACKENDS = [
+    ("esptool",  "ESP32 / ESP8266",      "pipx install esptool  (or pip install esptool)"),
+    ("picotool", "RP2040 / RP2350",      "apt install picotool"),
+    ("dfu-util", "STM32 and others in DFU", "apt install dfu-util"),
+    ("avrdude",  "AVR / Arduino classic","apt install avrdude"),
+    ("pyocd",    "Cortex-M over SWD/CMSIS-DAP", "pipx install pyocd"),
+    ("openocd",  "generic SWD/JTAG",     "apt install openocd"),
+]
+
+def have(t): return esptool_bin() is not None if t=="esptool" else shutil.which(t) is not None
+
+def esptool_bin():
+    """Pick a WORKING esptool.
+
+    A distro package and a pip install commonly coexist, and the older distro one can
+    ship an incomplete stub set: it detects the chip, prints its ID, then dies with
+    FileNotFoundError on stub_flasher_32.json. That reads as a broken board rather than
+    a broken toolchain. Prefer the highest version whose stub set is complete.
+    """
+    import re as _re, glob as _glob
+    cands = []
+    for d in os.environ.get("PATH","").split(":"):
+        c = os.path.join(d, "esptool")
+        if os.path.isfile(c) and os.access(c, os.X_OK) and c not in cands:
+            cands.append(c)
+    best, best_v = None, ()
+    for c in cands:
+        rc, out = sh(f"{c} version", 20)
+        m = _re.search(r'v?(\d+)\.(\d+)\.(\d+)', out or "")
+        if not m: continue
+        v = tuple(int(x) for x in m.groups())
+        if v > best_v: best, best_v = c, v
+    return best
+def sh(cmd, timeout=25):
+    try:
+        r=subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "")+(r.stderr or "")
+    except subprocess.TimeoutExpired: return 124, "(timed out)"
+    except Exception as e: return 1, str(e)
+
+def report_tools():
+    print(f"  {B}backends{N}")
+    for t,what,how in BACKENDS:
+        if have(t): print(f"    {G}yes{N}  {t:9s} {D}{what}{N}")
+        else:       print(f"    {R}no {N}  {t:9s} {D}{what}  ->  {how}{N}")
+
+def usb_ids():
+    _,out = sh("lsusb")
+    # skip root hubs: they are the controller, not anything anyone plugged in
+    return [m.group(1) for line in out.splitlines() if 'root hub' not in line
+            for m in re.finditer(r'ID ([0-9a-f]{4}:[0-9a-f]{4})', line)]
+
+def try_esptool(port):
+    if not have("esptool"): return None
+    # chip-id reads only; it does not touch flash contents
+    ex = esptool_bin() or "esptool"
+    rc,out = sh(f"{ex} --port {port} --before default-reset --after hard-reset chip-id", 40)
+    if rc!=0 and "Chip is" not in out: return None
+    d={}
+    for pat,key in [(r'Chip is ([^\n(]+)','chip'), (r'Features:\s*([^\n]+)','features'),
+                    (r'Crystal is (\S+)','crystal'), (r'MAC:\s*([0-9a-f:]+)','mac'),
+                    (r'Detected flash size:\s*(\S+)','flash')]:
+        m=re.search(pat,out)
+        if m: d[key]=m.group(1).strip()
+    if not d: return None
+    rc2,out2 = sh(f"{ex} --port {port} flash-id", 40)
+    m=re.search(r'Detected flash size:\s*(\S+)', out2)
+    if m: d['flash']=m.group(1)
+    m=re.search(r'Manufacturer:\s*(\S+)', out2)
+    if m: d['flash_mfr']=m.group(1)
+    return ("esptool", d)
+
+def try_picotool():
+    if not have("picotool"): return None
+    rc,out = sh("picotool info -a", 25)
+    if rc!=0 or not out.strip(): return None
+    d={}
+    for pat,key in [(r'type:\s*(\S+)','type'), (r'flash size:\s*(\S+)','flash'),
+                    (r'chip:\s*(\S+)','chip'), (r'board:\s*(\S+)','board')]:
+        m=re.search(pat,out,re.I)
+        if m: d[key]=m.group(1)
+    return ("picotool", d or {"raw": out.strip().splitlines()[0] if out.strip() else "?"})
+
+def try_dfu():
+    if not have("dfu-util"): return None
+    rc,out = sh("dfu-util -l", 20)
+    devs=[l.strip() for l in out.splitlines() if "Found DFU" in l]
+    if not devs: return None
+    return ("dfu-util", {"devices": "; ".join(devs[:3])})
+
+def try_pyocd():
+    if not have("pyocd"): return None
+    rc,out = sh("pyocd list", 25)
+    lines=[l for l in out.splitlines() if l.strip() and "No available" not in l]
+    if len(lines)<2: return None
+    return ("pyocd", {"probes": " | ".join(l.strip() for l in lines[1:4])})
+
+def main():
+    if "--tools" in sys.argv:
+        report_tools(); return 0
+
+    ports = [a for a in sys.argv[1:] if a.startswith("/dev/")]
+    if not ports:
+        ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+
+    ids = usb_ids()
+    print(f"  {B}usb ids present{N}: {' '.join(ids) or 'none'}")
+    print(f"  {B}serial ports{N}   : {' '.join(ports) or 'none'}\n")
+
+    found = False
+
+    # serial-attached families
+    for p in ports:
+        print(f"  {B}{p}{N}")
+        r = try_esptool(p)
+        if r:
+            found = True
+            name, d = r
+            print(f"    {G}identified via {name}{N}")
+            for k,v in d.items(): print(f"      {k:10s} {v}")
+        else:
+            print(f"      {D}no esptool response. not an ESP in bootloader mode, or the port is busy,{N}")
+            print(f"      {D}or it needs BOOT held while resetting.{N}")
+        print()
+
+    # bus-attached families, no serial port needed
+    for fn in (try_picotool, try_dfu, try_pyocd):
+        r = fn()
+        if r:
+            found = True
+            name, d = r
+            print(f"  {G}identified via {name}{N}")
+            for k,v in d.items(): print(f"    {k:10s} {v}")
+            print()
+
+    if not found:
+        print(f"  {Y}nothing identified.{N}")
+        print(f"  {D}if no serial port appeared at all, this is step 1 not step 2: run ./tools/enumerate{N}")
+        print(f"  {D}if a port exists but nothing answers, hold BOOT and tap RESET, then retry{N}")
+        report_tools()
+        return 1
+    return 0
+
+sys.exit(main())

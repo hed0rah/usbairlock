@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""dump -- read the firmware off a board BEFORE you write anything to it.
+
+    ./tools/dump /dev/ttyACM0          esp, size auto-detected
+    ./tools/dump --rp2040              a Pico in BOOTSEL
+    ./tools/dump /dev/ttyACM0 --size 0x400000
+
+Step 3, and the one people skip. On an unknown board the vendor firmware is the only
+copy of whatever it does. Flashing your own blinky destroys the evidence permanently:
+what it talked to, what it stored, whether it was doing anything it should not.
+
+Dumps land in dumps/ with a sha256 beside them. That directory is gitignored: the
+images can be large and they are not ours to redistribute.
+
+This tool never writes to a device.
+"""
+import glob, hashlib, os, re, shutil, subprocess, sys, time
+
+G="\033[32m"; Y="\033[33m"; R="\033[31m"; D="\033[2m"; B="\033[1m"; N="\033[0m"
+ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT=os.path.join(ROOT,"dumps")
+
+def esptool_bin():
+    """Pick the highest-versioned esptool on PATH.
+
+    A distro package and a pipx install commonly coexist and the older one can ship an
+    incomplete stub set, dying partway through with FileNotFoundError. Resolution order
+    is not version order, so choose explicitly.
+    """
+    import re as _re
+    best, best_v = None, ()
+    for d in os.environ.get("PATH","").split(":"):
+        c = os.path.join(d, "esptool")
+        if not (os.path.isfile(c) and os.access(c, os.X_OK)): continue
+        try:
+            out = subprocess.run([c,"version"],capture_output=True,text=True,timeout=15).stdout
+        except Exception: continue
+        m = _re.search(r'v?(\d+)\.(\d+)\.(\d+)', out or "")
+        if not m: continue
+        v = tuple(int(x) for x in m.groups())
+        if v > best_v: best, best_v = c, v
+    return best or "esptool"
+
+def sh(cmd,timeout=600):
+    print(f"{D}    $ {cmd}{N}", flush=True)
+    r=subprocess.run(cmd,shell=True,capture_output=True,text=True,timeout=timeout)
+    return r.returncode,(r.stdout or "")+(r.stderr or "")
+
+def sha(path):
+    h=hashlib.sha256()
+    with open(path,'rb') as f:
+        for b in iter(lambda:f.read(1<<20),b''): h.update(b)
+    return h.hexdigest()
+
+def finish(path):
+    if not os.path.exists(path) or os.path.getsize(path)==0:
+        print(f"  {R}dump failed or produced an empty file{N}"); return 1
+    digest=sha(path)
+    open(path+".sha256","w").write(f"{digest}  {os.path.basename(path)}\n")
+    size=os.path.getsize(path)
+    print(f"\n  {G}dumped{N} {path}")
+    print(f"    size   {size} bytes ({size/1024/1024:.2f} MiB)")
+    print(f"    sha256 {digest}")
+    print(f"\n  {D}worth doing next, all read-only:{N}")
+    print(f"    strings -n 8 {path} | sort -u | less     {D}# urls, ssids, tokens, build paths{N}")
+    print(f"    binwalk {path}                            {D}# embedded filesystems{N}")
+    print(f"    xxd {path} | head -40                     {D}# bootloader header{N}")
+    return 0
+
+def esp(port,size):
+    if not shutil.which("esptool"):
+        print(f"  {R}esptool not installed{N}"); return 1
+    os.makedirs(OUT,exist_ok=True)
+    ex=esptool_bin()
+    rc,out=sh(f"{ex} --port {port} flash-id",60)
+    chip=(re.search(r'Chip is ([^\n(]+)',out) or [None,"unknown"])[1].strip().replace(" ","_")
+    if not size:
+        m=re.search(r'Detected flash size:\s*(\d+)(MB|KB)',out)
+        if m:
+            size=int(m.group(1))*(1024*1024 if m.group(2)=="MB" else 1024)
+            print(f"  detected flash: {m.group(1)}{m.group(2)}")
+        else:
+            size=4*1024*1024
+            print(f"  {Y}flash size not detected, assuming 4MB. override with --size{N}")
+    stamp=time.strftime("%Y%m%d-%H%M%S")
+    path=os.path.join(OUT,f"{stamp}_{chip}_{size//1024}k.bin")
+    rc,out=sh(f"{ex} --port {port} read-flash 0 {hex(size)} {path}",900)
+    if rc!=0: print(out[-600:])
+    return finish(path)
+
+def rp2040():
+    if not shutil.which("picotool"):
+        print(f"  {R}picotool not installed{N}"); return 1
+    os.makedirs(OUT,exist_ok=True)
+    stamp=time.strftime("%Y%m%d-%H%M%S")
+    path=os.path.join(OUT,f"{stamp}_rp2040.bin")
+    rc,out=sh(f"picotool save -a {path}",600)
+    if rc!=0: print(out[-600:])
+    return finish(path)
+
+def main():
+    args=sys.argv[1:]
+    size=None
+    if "--size" in args:
+        size=int(args[args.index("--size")+1],0)
+    if "--rp2040" in args: return rp2040()
+    ports=[a for a in args if a.startswith("/dev/")]
+    if not ports: ports=sorted(glob.glob("/dev/ttyACM*")+glob.glob("/dev/ttyUSB*"))
+    if not ports:
+        print(f"  {Y}no serial port. run ./tools/enumerate first.{N}")
+        print(f"  {D}for a Pico in BOOTSEL there is no port: use --rp2040{N}")
+        return 1
+    print(f"  {B}dumping from {ports[0]}{N}  {D}(read-only, nothing is written to the device){N}")
+    return esp(ports[0],size)
+
+sys.exit(main())

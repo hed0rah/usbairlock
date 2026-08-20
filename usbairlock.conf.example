@@ -1,0 +1,19 @@
+# usbairlock configuration
+# every value here is also settable as a command-line flag,
+# and the flag wins.
+
+[protections]
+withhold_device = true
+unbind_hid = false
+unbind_storage = false
+unbind_net = false
+
+[monitor]
+poll_interval = 1.0
+auto_inspect = true
+descriptors = summary
+bell_on_high = true
+
+[paths]
+dumps = dumps
+

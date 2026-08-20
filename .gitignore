@@ -1,0 +1,5 @@
+dumps/
+*.bin
+*.img
+__pycache__/
+*.pyc

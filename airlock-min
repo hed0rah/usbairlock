@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""airlock-min -- the whole idea, one file, nothing but the standard library.
+
+    ./airlock-min              watch and report
+    sudo ./airlock-min --arm   hold new devices unbound while watching
+    ./airlock-min --once       report what is attached, then exit
+
+Drop this on any Linux box. No package, no config, no install, no lsusb. Reads sysfs
+directly and works on python3.6+.
+
+The full ./usbairlock adds protections you can toggle, keystroke capture, a two-pane
+view and a config file. This is the part that has to work everywhere, so it is the part
+kept small enough to read in one sitting.
+"""
+import glob, os, sys, time
+
+GATE = "/sys/bus/usb/devices/usb*/authorized_default"
+IGATE = "/sys/bus/usb/devices/usb*/interface_authorized_default"
+TTY = sys.stdout.isatty()
+def c(code, s): return ("\033[%sm%s\033[0m" % (code, s)) if TTY else s
+
+CLASSES = {0x01:"audio",0x02:"comms/CDC",0x03:"HID",0x06:"image",0x07:"printer",
+           0x08:"mass storage",0x09:"hub",0x0a:"CDC-data",0x0b:"smartcard",0x0e:"video",
+           0xdc:"diagnostic",0xe0:"wireless",0xef:"misc",0xff:"vendor-specific"}
+KNOWN = {"303a:1001":"Espressif native USB","1a86:7523":"CH340","10c4:ea60":"CP2102",
+         "0403:6001":"FT232","2e8a:0003":"RP2040 BOOTSEL","0483:df11":"STM32 DFU",
+         "0483:374b":"ST-Link v2.1","0d28:0204":"DAPLink"}
+
+def rd(p, d=""):
+    try:
+        f = open(p); v = f.read().strip(); f.close(); return v
+    except Exception:
+        return d
+
+def devices():
+    """Every attached non-hub device, straight from sysfs. No external binary."""
+    out = {}
+    for path in sorted(glob.glob("/sys/bus/usb/devices/*/")):
+        name = os.path.basename(path.rstrip("/"))
+        if name.startswith("usb") or ":" in name:      # root hub or interface dir
+            continue
+        vid, pid = rd(path+"idVendor"), rd(path+"idProduct")
+        if not vid or rd(path+"bDeviceClass") == "09": # missing, or a downstream hub
+            continue
+        ifs = []
+        for i in sorted(glob.glob(path+"*:*")):
+            # os.path.join, NOT i+"name": glob returns no trailing slash, so string
+            # concatenation silently produced ".../1-1:1.0bInterfaceClass", every read
+            # failed, and every device reported class 0x00 with no drivers bound. A
+            # false clean, which is the worst answer this program can give.
+            j = lambda n: os.path.join(i, n)
+            ifs.append((int(rd(j("bInterfaceClass"), "0") or "0", 16),
+                        rd(j("bInterfaceSubClass"), "0"),
+                        rd(j("bInterfaceProtocol"), "0"),
+                        os.path.basename(os.path.realpath(j("driver")))
+                            if os.path.exists(j("driver")) else None))
+        out[name] = {"id": vid+":"+pid, "ifs": ifs,
+                     "product": rd(path+"product"), "vendor": rd(path+"manufacturer"),
+                     "auth": rd(path+"authorized"), "speed": rd(path+"speed"),
+                     "power": rd(path+"bMaxPower")}
+    return out
+
+def assess(d):
+    """The rules that matter, in the smallest honest form. Returns [(level, why)]."""
+    out, cls = [], set(i[0] for i in d["ifs"])
+    if 0x03 in cls and 0x08 in cls:
+        out.append(("HIGH", "HID and mass storage together: the BadUSB shape"))
+    for k, sub, proto, drv in d["ifs"]:
+        if k == 0x03 and proto == "01":
+            out.append(("HIGH", "boot-protocol KEYBOARD: can type into your session"))
+        elif k == 0x03 and proto == "02":
+            out.append(("MED", "boot-protocol mouse"))
+        elif k == 0x03:
+            out.append(("MED", "raw HID, intent opaque without its report descriptor"))
+        # class e0 is Bluetooth AND RNDIS; only 0e0/01/03 is the network takeover risk
+        if k == 0xe0 and sub == "01" and proto == "03":
+            out.append(("MED", "RNDIS: can take over DNS and routing on bind"))
+        if k == 0x02 and sub in ("06", "0d"):
+            out.append(("MED", "CDC ethernet: can take over DNS and routing on bind"))
+    if 0x03 in cls and (0x02 in cls or 0x0a in cls):
+        out.append(("MED", "HID beside a serial interface: odd for a plain adapter"))
+    if cls == set([0xff]):
+        out.append(("LOW", "vendor-specific only: descriptors say nothing"))
+    if d["auth"] == "0":
+        out.append(("LOW", "held: not authorized, no driver binds"))
+    if not d["ifs"] and d["auth"] != "0":
+        out.append(("LOW", "no interfaces readable"))
+    return out
+
+def show(node, d, arrived=False):
+    tag = c("1;32", "+ ARRIVED") if arrived else c("2", "  present")
+    label = (d["vendor"]+" "+d["product"]).strip() or "(no strings)"
+    print("  %s  %s %s  %s" % (time.strftime("%H:%M:%S"), tag, c("1", d["id"]), label))
+    known = KNOWN.get(d["id"])
+    if known: print("                 %s" % c("36", "known: "+known))
+    drivers = [i[3] for i in d["ifs"] if i[3]]
+    print("                 %s" % (c("35","drivers: "+" ".join(drivers)) if drivers
+                                   else c("32","no drivers bound")))
+    for k, sub, proto, drv in d["ifs"]:
+        print("                 %s class 0x%02x %-14s sub=%s proto=%s"
+              % (c("36","if"), k, CLASSES.get(k,"?"), sub, proto))
+    hits = assess(d)
+    for lvl, why in hits:
+        col = {"HIGH":"1;31","MED":"33","LOW":"2"}[lvl]
+        print("                 %s %s" % (c(col,"["+lvl+"]"), why))
+    if not hits: print("                 %s" % c("32","no suspect claims"))
+    return max([{"HIGH":3,"MED":2,"LOW":1}[l] for l,_ in hits] or [0])
+
+def set_gates(v):
+    n = 0
+    for p in glob.glob(GATE) + glob.glob(IGATE):
+        try:
+            f = open(p, "w"); f.write(str(v)); f.close(); n += 1
+        except Exception:
+            pass
+    return n
+
+def main():
+    arm  = "--arm"  in sys.argv
+    once = "--once" in sys.argv
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__); return 0
+
+    restore = False
+    if arm:
+        if os.geteuid() != 0:
+            print("  --arm needs root"); return 1
+        n = set_gates(0); restore = True
+        print("  %s  %d gates held: devices will enumerate but no driver binds"
+              % (c("1;32","ARMED"), n))
+
+    try:
+        seen = devices()
+        for k in sorted(seen): show(k, seen[k])
+        if once: return 0
+        print("  %s" % c("2","watching. ctrl-c to stop."))
+        while True:
+            time.sleep(1)
+            now = devices()
+            for k in sorted(set(now) - set(seen)):
+                if show(k, now[k], True) >= 3 and TTY:
+                    sys.stdout.write("\a"); sys.stdout.flush()
+            for k in sorted(set(seen) - set(now)):
+                print("  %s  %s %s" % (time.strftime("%H:%M:%S"),
+                                       c("33","- removed"), seen[k]["id"]))
+            seen = now
+    except KeyboardInterrupt:
+        print()
+    finally:
+        if restore:
+            print("  %s  %d gates released" % (c("2","restored"), set_gates(1)))
+    return 0
+
+sys.exit(main())
