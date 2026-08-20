@@ -21,7 +21,7 @@ is worse than no tool.
 
 **BadUSB and Rubber Ducky class.** A device that claims an HID keyboard interface, alone
 or alongside storage, is the whole attack. It is visible in the descriptors before any
-driver binds, and `guard` stops the bind. This is the main threat for an unknown board and
+driver binds, and withholding interface authorization stops the bind. This is the main threat for an unknown board and
 it is fully addressed here.
 
 **Identity switching.** A device advertising multiple configurations can present one

@@ -9,6 +9,11 @@ An airlock is a chamber you pass through before the thing you are entering. A de
 enumerates, its descriptors are read, its claims are judged, and only then does anything
 get to bind.
 
+This is a bench workflow with that gate at the front. `usbairlock` decides whether a
+device binds; `tools/` handles what comes after, once something has been let through and
+the question turns from whether to trust it into what it actually is. Only the first half
+makes a security claim.
+
 ```sh
 sudo ./usbairlock --auto        # the usual run: withhold, inspect, record what types
 sudo ./usbairlock --auto -q     # same, trusting and hiding what is already plugged in
@@ -291,7 +296,16 @@ paths, including the BadUSB and Rubber Ducky shapes, without owning either.
 
 ## after the airlock: identifying the board
 
-Once a device is admitted, the question becomes what chip it actually is.
+Once a device is admitted the question stops being whether it is hostile and becomes what
+it is. Nothing below detects threats. A board's silicon says nothing about its intent, and
+`rules.py` judges claimed interface classes, never chips: a Rubber Ducky is usually some
+anonymous ATtiny, and a Pico is not dangerous by virtue of being a Pico. This is ordinary
+hardware triage, kept here because it is the other half of the same bench session.
+
+One rule does carry across, and it is the gate's own rule one layer down: **do not destroy
+the evidence before you have looked at it.** The airlock will not let a driver bind until
+the descriptors have been read. Step 3 will not let you flash until the firmware has been
+read.
 
 ### the four steps, every family, every time
 
@@ -308,8 +322,10 @@ storage, it is a device that claims to be a **keyboard** and types the moment it
 enumerates. "I will just have a look at it first" does not protect you, because looking
 happens after enumeration.
 
-`usbguard` is the piece that makes triage real rather than theatrical: it allowlists by
-device class **before** the kernel binds a driver. See `notes/threat-model.md`.
+That is the entire reason this withholds authorization instead of filtering after the
+fact. The decision has to land **before** the kernel binds a driver, because afterwards
+the keyboard has already typed. See `notes/threat-model.md` for what that does and does
+not cover.
 
 ## layout
 
@@ -336,6 +352,10 @@ device class **before** the kernel binds a driver. See `notes/threat-model.md`.
 | any Cortex-M | SWD probe | `openocd` IDCODE scan | target dependent |
 
 ## the failure that is not a failure
+
+`notes/threat-model.md` puts charge-only cables in the row this tier **cannot** catch, and
+that is not a hedge: a device that never enumerates never reaches the gate, so the tool is
+blind here by construction. Recognising it by hand is the only substitute.
 
 A board that powers up, drives its screen, and produces **no USB event at all** is not
 broken software. The host never saw a connect, so it is electrical: a charge-only cable,
