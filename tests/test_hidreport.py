@@ -162,6 +162,68 @@ def main():
     check("a boot keyboard is not reported twice",
           len([t for t in rules.assess(boot) if "keyboard" in t[1].lower()]), 1)
 
+    # -- power claims and endpoint labels ----------------------------------------
+    # bmAttributes arrives as bare hex digits, because the regex that captures it strips
+    # the "0x". "80" is all decimal digits while meaning 0x80, so parsing decimal first
+    # turned a bus-powered device into a self-powered one -- the tool lying about
+    # hardware rather than merely being unhelpful.
+    from airlock import usbinfo as ui
+    for raw, sp, rw in (("80", False, False), ("e0", True, True),
+                        ("c0", True, False), ("a0", False, True)):
+        r = ui.power_claim(raw)
+        check(f"bmAttributes 0x{raw}: self-powered", r["self_powered"], sp)
+        check(f"bmAttributes 0x{raw}: remote wakeup", r["remote_wakeup"], rw)
+    check("a decimal-looking hex value is not read as decimal",
+          ui.power_claim("80")["self_powered"], False)
+    check("garbage returns nothing rather than guessing", ui.power_claim("zz"), None)
+    check("missing returns nothing", ui.power_claim(None), None)
+
+    for ep, want in (("0x83", "ep3 IN"), ("0x02", "ep2 OUT"),
+                     ("0x81", "ep1 IN"), ("0x0f", "ep15 OUT")):
+        check(f"endpoint {ep}", ui.endpoint_label(ep), want)
+    check("an unparseable endpoint is passed through",
+          ui.endpoint_label("bogus"), "bogus")
+
+    # -- what is readable while the gate is still shut ---------------------------
+    # All of this is populated at enumeration, before anything binds, so it is available
+    # for a device the airlock is holding.
+
+    # Kernel quirks: names taken verbatim from include/linux/usb/quirks.h. A non-zero
+    # value means the kernel already knows this exact hardware misbehaves in a named
+    # way -- a fact from a source with no opinion about this tool.
+    check("quirks 0x400 is no-lpm", ui.quirk_names("0x400"), ["no-lpm"])
+    check("zero quirks is empty, not a false signal", ui.quirk_names("0x0"), [])
+    check("several bits decode in order",
+          ui.quirk_names("0x42"), ["reset-resume", "delay-init"])
+    check("bit 0 is not skipped", ui.quirk_names("0x1"), ["string-fetch-255"])
+    check("the highest known bit decodes",
+          ui.quirk_names("0x10000"), ["short-set-address-req-timeout"])
+    # a newer kernel may set bits this table predates: report them rather than drop them
+    got = ui.quirk_names("0x80000")
+    check("an unknown bit is surfaced as hex rather than silently dropped",
+          any(x.startswith("0x") for x in got), True)
+    check("garbage decodes to nothing", ui.quirk_names("nonsense"), [])
+    check("missing decodes to nothing", ui.quirk_names(None), [])
+
+    # removable: firmware saying whether a human could have plugged this in
+    check("fixed means soldered in", "internal" in (ui.attachment("fixed") or ""), True)
+    check("removable means a real port",
+          "user-accessible" in (ui.attachment("removable") or ""), True)
+    check("unknown says nothing, because behind a hub firmware does not know",
+          ui.attachment("unknown"), None)
+    check("missing says nothing", ui.attachment(None), None)
+
+    # link speed: only the unambiguous case, or the signal drowns in normal devices
+    check("usb3 on a 2.0 path is flagged",
+          "USB 2 path" in (ui.link_note("3.00", "480") or ""), True)
+    check("usb3 at superspeed is silent", ui.link_note("3.00", "5000"), None)
+    check("a bluetooth adapter at full speed is silent, this is normal",
+          ui.link_note("2.01", "12"), None)
+    check("a usb1.1 device at its own maximum is silent",
+          ui.link_note("1.10", "12"), None)
+    check("unparseable input is silent", ui.link_note("x", "y"), None)
+    check("speed names are human", ui.speed_name("5000"), "SuperSpeed (5 Gb/s)")
+
     ok = sum(_results)
     print(f"\n  {ok} passed, {len(_results) - ok} failed\n")
     return 0 if ok == len(_results) else 1

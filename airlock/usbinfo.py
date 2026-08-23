@@ -131,6 +131,181 @@ def resolve(spec):
 # printed. There is no second place to forget.
 _UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
+def power_claim(cfg_attrs):
+    """Decode bmAttributes into what the device CLAIMS about its own power.
+
+    bit 6 self-powered, bit 5 remote wakeup, bit 7 reserved and always set.
+
+    Worth surfacing rather than leaving in the raw byte, because it is a claim and
+    devices lie about it. A bus-powered hub reporting self-powered tells the kernel each
+    downstream port may draw a full load; the kernel believes it, allows it, and the
+    devices behind it brown out with no power rejection logged anywhere, because nothing
+    was ever rejected. Two such hubs were measured here reporting exactly that.
+    """
+    # ALWAYS base 16. The regex that captures this strips the "0x", so the value arrives
+    # as bare hex digits -- and "80" is all-decimal-digits while meaning 0x80. Trying
+    # decimal first turned a bus-powered device into a self-powered one, which is the
+    # tool lying about hardware rather than merely being unhelpful.
+    try:
+        v = int(str(cfg_attrs), 16)
+    except (TypeError, ValueError):
+        return None
+    return {"self_powered": bool(v & 0x40), "remote_wakeup": bool(v & 0x20), "raw": v}
+
+
+# Negotiated speed, by the USB generation that can reach it.
+_SPEED_TIER = ((10000, "SuperSpeed+ (10 Gb/s)"), (5000, "SuperSpeed (5 Gb/s)"),
+               (480, "High Speed (480 Mb/s)"), (12, "Full Speed (12 Mb/s)"),
+               (1.5, "Low Speed (1.5 Mb/s)"))
+
+
+# Kernel workarounds registered against specific hardware. Names taken verbatim from
+# include/linux/usb/quirks.h. A non-zero value means the kernel already knows this exact
+# device misbehaves in a named way -- which is a fact about the hardware you are holding,
+# from a source with no opinion about this tool.
+USB_QUIRKS = {
+    1 << 0: "string-fetch-255",   1 << 1: "reset-resume",
+    1 << 2: "no-set-intf",        1 << 3: "config-intf-strings",
+    1 << 4: "needs-reset",        1 << 5: "honor-bnuminterfaces",
+    1 << 6: "delay-init",         1 << 7: "linear-uframe-intr-binterval",
+    1 << 8: "device-qualifier",   1 << 9: "ignore-remote-wakeup",
+    1 << 10: "no-lpm",            1 << 11: "linear-frame-intr-binterval",
+    1 << 12: "disconnect-suspend", 1 << 13: "delay-ctrl-msg",
+    1 << 14: "hub-slow-reset",    1 << 15: "endpoint-ignore",
+    1 << 16: "short-set-address-req-timeout",
+}
+
+
+def quirk_names(raw):
+    """Decode /sys/.../quirks into the kernel's own names for each workaround."""
+    try:
+        v = int(str(raw), 16) if str(raw).lower().startswith("0x") else int(str(raw))
+    except (TypeError, ValueError):
+        return []
+    if not v:
+        return []
+    out = [n for bit, n in sorted(USB_QUIRKS.items()) if v & bit]
+    left = v & ~sum(b for b in USB_QUIRKS if v & b)
+    if left:
+        out.append("0x%x" % left)          # a newer kernel than this table knows about
+    return out
+
+
+def port_location(devdir):
+    """Where the connector physically is, from ACPI, or None.
+
+    Every device has a `port` symlink. Ports on the machine itself carry a
+    physical_location the firmware filled in; ports on a downstream hub do not, because
+    firmware only describes its own chassis. So this answers "which socket" for something
+    plugged into the computer, and says nothing for something behind a hub -- which is
+    honest, since nothing knows.
+    """
+    port = os.path.join(devdir or "", "port")
+    loc = os.path.join(port, "physical_location")
+    if not os.path.isdir(loc):
+        return None
+    panel = _attr(loc, "panel")
+    horiz = _attr(loc, "horizontal_position")
+    vert = _attr(loc, "vertical_position")
+    if not panel or panel == "unknown":
+        return None
+    where = " ".join(x for x in (vert, horiz) if x and x != "unknown")
+    out = f"{where} {panel} panel".strip() if where else f"{panel} panel"
+    if _attr(loc, "dock") == "yes":
+        out += ", on a dock"
+    if _attr(loc, "lid") == "yes":
+        out += ", on the lid"
+    ct = _attr(port, "connect_type")
+    if ct and ct != "unknown":
+        out += f" ({ct})"
+    return out
+
+
+def attachment(removable):
+    """Whether firmware says a human could have plugged this in.
+
+    `fixed` means the port is not user-accessible -- a soldered webcam or bluetooth
+    module. `removable` means it is. `unknown` is what you get for anything behind a
+    hub, because firmware only describes the ports on the machine itself.
+
+    Useful for triage in the plainest way: it separates what was already inside the
+    machine from what somebody attached to it.
+    """
+    v = (removable or "").strip().lower()
+    return {"fixed": "internal, soldered to this machine",
+            "removable": "user-accessible port"}.get(v)
+
+
+def link_note(usb_version, speed):
+    """A note when a link negotiated well below what the device declares, or None.
+
+    Deliberately narrow. Almost every device that runs slower than its declared version
+    is doing so on purpose: a Bluetooth adapter declaring USB 2.01 and running at 12
+    Mb/s has no use for High Speed, and flagging that would bury the one case that
+    actually means something.
+
+    That case is a USB 3 device on a link below SuperSpeed. There is no design reason
+    for it, so it is one of: a USB 2 cable, a USB 2 port, or a USB 2 hub somewhere in
+    the chain. All three are things the operator can fix and would want to know about.
+    """
+    try:
+        ver = float(str(usb_version))
+        spd = float(str(speed))
+    except (TypeError, ValueError):
+        return None
+    if ver >= 3.0 and spd < 5000:
+        return ("declares USB %.2f but negotiated %s -- a USB 2 path. "
+                "Check the cable, the port, and for a 2.0 hub in the chain"
+                % (ver, speed_name(spd)))
+    return None
+
+
+def speed_name(speed):
+    try: spd = float(str(speed))
+    except (TypeError, ValueError): return str(speed)
+    for floor, name in _SPEED_TIER:
+        if spd >= floor:
+            return name
+    return "%s Mb/s" % speed
+
+
+_EP_SHORT = {"isochronous": "iso", "interrupt": "int", "bulk": "bulk", "control": "ctrl"}
+
+
+def endpoint_label(ep, verbose=False):
+    """A readable endpoint.
+
+    Accepts the structured form the descriptor parser produces, and a bare address
+    string for anything still holding one.
+    """
+    if isinstance(ep, dict):
+        base = "ep%s %s %s" % (ep.get("num"), ep.get("dir"),
+                               _EP_SHORT.get(ep.get("type"), ep.get("type")))
+        if not verbose:
+            return base
+        return "%s  %sB  every %s" % (base, ep.get("max_packet"), _interval(ep))
+    try:
+        v = int(str(ep), 16)
+    except (TypeError, ValueError):
+        return str(ep)
+    return "ep%d %s" % (v & 0x0F, "IN" if v & 0x80 else "OUT")
+
+
+def _interval(ep):
+    """bInterval in something a person can read.
+
+    Its meaning depends on speed and transfer type, which is why it is so often
+    misreported. For interrupt and isochronous at high speed it is 2^(n-1) microframes
+    of 125us; at full and low speed it is n milliseconds. Bulk and control ignore it.
+    """
+    n = _int(ep.get("interval"))
+    if n is None:
+        return "?"
+    if ep.get("type") in ("bulk", "control"):
+        return "n/a"
+    return "%s frame%s" % (n, "" if n == 1 else "s")
+
+
 def safe_text(v, limit=200):
     """Device-supplied text, made safe to print, log and parse. Never bypass this."""
     t = str(v or "").replace("\t", " ")
@@ -238,13 +413,92 @@ def _attr(d, name):
     except Exception: return None
 
 def descriptors(spec):
-    """Parse lsusb -v into something structured. Works unprivileged for interfaces.
+    """Everything structural about a device, from its own descriptor bytes.
 
-    Addressed with `lsusb -s BUS:DEV` rather than `-d VID:PID` whenever the device
-    can be located. `-d` matches on model, so two identical devices dump one after
-    the other into the same text and the parse silently merges them.
+    The kernel exposes the raw device and configuration descriptors at
+    /sys/bus/usb/devices/*/descriptors, exactly as the device sent them. Parsing those
+    directly is the primary path, and it is better than the alternative in three ways:
+
+      - no external dependency. lsusb is a text scrape of these same bytes, and a triage
+        box is precisely the machine that will not have usbutils installed.
+      - no subprocess, so no shell, no argument handling, and it is faster.
+      - more accurate. The text scrape collapsed alternate settings, so an audio
+        interface with its endpoints on alt 1 appeared to have none at all. Endpoint
+        transfer type, max packet size and interval were not available either.
+
+    lsusb is still consulted for one thing when it exists: the iInterface strings, which
+    are string-descriptor INDICES in the blob rather than text. Nothing depends on it.
     """
     d = sysfs_for(spec)
+    if d:
+        try:
+            with open(os.path.join(d, "descriptors"), "rb") as fh:
+                blob = fh.read()
+            parsed = rules.parse_descriptors(blob)
+            if parsed.get("id"):
+                return _enrich(parsed, d, spec)
+        except OSError:
+            pass          # unreadable without root; fall through to lsusb
+    return _descriptors_lsusb(spec, d)
+
+
+def _hid_reports(dev, d, spec):
+    """Fetch the report descriptor for any HID interface no driver is holding.
+
+    Deliberately narrow. It is a real control transfer to the device, so it runs only
+    when it can succeed and only when it says something not already known:
+      - HID class, and NOT boot protocol. A boot keyboard has already declared itself.
+      - no driver bound: the kernel returns EBUSY for a control transfer aimed at an
+        interface a driver owns. That is exactly the state the airlock creates, so this
+        reads a held device and does not bother a working one.
+      - root, since it needs the usbfs node.
+    """
+    rds = {}
+    for i in sorted(glob.glob(os.path.join(d, "*:*"))):
+        try:
+            if _attr(i, "bInterfaceClass") != "03":            continue
+            if _attr(i, "bInterfaceProtocol") in ("01", "02"): continue
+            if os.path.exists(os.path.join(i, "driver")):      continue
+            num = _attr(i, "bInterfaceNumber")
+            if num is None:                                    continue
+            n = int(num, 16) if not str(num).isdigit() else int(num)
+            from . import capture as _cap
+            raw = _cap.report_descriptor(spec, n)
+            if raw:
+                rds[str(n)] = raw
+        except Exception:
+            continue        # a device that will not answer is a fact, not a fault
+    if rds:
+        dev["report_descriptors"] = rds
+    return dev
+
+
+def _enrich(dev, d, spec):
+    """Add what sysfs knows and the blob does not: resolved strings, live driver state."""
+    dev["addr"] = addr_of(d)
+    dev["bus"], dev["devnum"] = _attr(d, "busnum"), _attr(d, "devnum")
+    dev["speed"] = _attr(d, "speed")
+    dev["authorized"] = _attr(d, "authorized")
+    dev["maxchild"] = _attr(d, "maxchild")
+    dev["removable"] = _attr(d, "removable")
+    dev["quirks"] = _attr(d, "quirks")
+    # Strings are indices in the descriptor blob; the kernel has already resolved them.
+    for k, a in (("manufacturer", "manufacturer"), ("product", "product"),
+                 ("serial", "serial")):
+        v = _attr(d, a)
+        if v: dev[k] = safe_text(v)
+    drivers = []
+    for i in glob.glob(os.path.join(d, "*:*")):
+        drv = os.path.join(i, "driver")
+        if os.path.exists(drv):
+            drivers.append(os.path.basename(os.path.realpath(drv)))
+    dev["drivers"] = sorted(set(drivers))
+    _hid_reports(dev, d, spec)
+    return dev
+
+
+def _descriptors_lsusb(spec, d):
+    """Fallback: parse lsusb -v. Only reached when the raw blob cannot be read."""
     # argv, never a shell string. `spec` reaches here straight from --inspect/--capture,
     # and this runs as root. A vid:pid is also validated rather than trusted: if it does
     # not look like one, do not hand it to lsusb at all.
@@ -308,35 +562,13 @@ def descriptors(spec):
             drv = os.path.join(i, "driver")
             if os.path.exists(drv): drivers.append(os.path.basename(os.path.realpath(drv)))
         dev["drivers"] = sorted(set(drivers))
+        # Readable while the gate is shut: all of this is populated at enumeration,
+        # before anything binds.
+        dev["bcd_device"]   = _attr(d, "bcdDevice")     # device/firmware revision
+        dev["removable"]    = _attr(d, "removable")     # internal vs plugged in
+        dev["quirks"]       = _attr(d, "quirks")        # kernel workarounds for it
+        dev["n_interfaces"] = _attr(d, "bNumInterfaces")
 
-        # Fetch the report descriptor for any HID interface no driver is holding.
-        #
-        # Deliberately narrow. It is a real control transfer to the device, so it runs
-        # only when it can actually succeed and only when it tells us something we do
-        # not already know:
-        #   - HID class, and NOT boot protocol. A boot keyboard has already declared
-        #     itself; the descriptor adds nothing to that verdict.
-        #   - no driver bound, because the kernel returns EBUSY for a control transfer
-        #     aimed at an interface a driver owns. That is exactly the state the airlock
-        #     creates, so this reads a held device and refuses to bother a working one.
-        #   - root, since it needs the usbfs node.
-        rds = {}
-        for i in sorted(glob.glob(os.path.join(d, "*:*"))):
-            try:
-                if _attr(i, "bInterfaceClass") != "03":              continue
-                if _attr(i, "bInterfaceProtocol") in ("01", "02"):   continue
-                if os.path.exists(os.path.join(i, "driver")):        continue
-                num = _attr(i, "bInterfaceNumber")
-                if num is None:                                      continue
-                from . import capture as _cap
-                raw = _cap.report_descriptor(spec, int(num, 16) if
-                                             not str(num).isdigit() else int(num))
-                if raw:
-                    rds[str(int(num, 16) if not str(num).isdigit() else int(num))] = raw
-            except Exception:
-                continue          # a device that will not answer is a fact, not a fault
-        if rds:
-            dev["report_descriptors"] = rds
     return dev
 
 _i = rules.to_int

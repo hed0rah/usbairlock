@@ -8,6 +8,8 @@
     sudo ./usbairlock --paranoid --auto  every protection on, plus recording
     ./usbairlock --status                what is protected right now, then exit
     ./usbairlock --diagnose              nothing appeared, why not
+    sudo ./usbairlock --verbose ADDR     every descriptor, decoded, with a byte count
+    sudo ./usbairlock --hid ADDR         what a HID device declares it can send
     ./usbairlock --write-config          print a config file to stdout
 
 One monitor runs at a time. A second one is refused rather than allowed to fight it over
@@ -92,7 +94,25 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
         for k, lab in (("usb_version","usb"), ("speed","speed"), ("max_power","power"),
                        ("n_configs","configs"), ("authorized","authorized")):
             if d.get(k): bits.append(f"{lab}={d[k]}")
+        # What the device claims about its own power. A hub asserting self-powered
+        # while it has no supply is why the things behind it fail with nothing logged.
+        pw = usbinfo.power_claim(d.get("cfg_attrs"))
+        if pw:
+            bits.append("self-powered" if pw["self_powered"] else "bus-powered")
+            if pw["remote_wakeup"]: bits.append("remote-wakeup")
+        if d.get("bcd_device"): bits.append(f"rev={d['bcd_device']}")
         if bits: p(f"                 {C['D']}{'  '.join(bits)}{C['N']}")
+        # Everything below is readable while the gate is shut, before anything binds.
+        note = usbinfo.link_note(d.get("usb_version"), d.get("speed"))
+        if note:
+            p(f"                 {C['Y']}slow link{C['N']}  {C['D']}{note}{C['N']}")
+        att = usbinfo.attachment(d.get("removable"))
+        if att:
+            p(f"                 {C['D']}port: {att}{C['N']}")
+        qk = usbinfo.quirk_names(d.get("quirks"))
+        if qk:
+            p(f"                 {C['Y']}kernel quirks{C['N']}  {C['D']}{', '.join(qk)}"
+              f"  -- the kernel has workarounds registered for this hardware{C['N']}")
         for k in ("manufacturer", "product", "serial"):
             if d.get(k): p(f"                 {C['D']}{k}: {d[k]}{C['N']}")
         if d.get("drivers"):
@@ -105,8 +125,14 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
             c = usbinfo._i(i.get("cls"))
             nm = usbinfo.CLASSES.get(c, "?")
             extra = f"  {C['D']}{i['name']}{C['N']}" if mode == "full" and i.get("name") else ""
-            eps = f" eps={len(i.get('eps',[]))}" if mode == "full" else ""
-            p(f"                 {C['C']}if{i.get('num')}{C['N']} class 0x{c:02x} {nm:16s}"
+            # Endpoint ADDRESSES, not a count. This is the first thing you want on
+            # bring-up, and it names the endpoint a capture would read.
+            _e = [usbinfo.endpoint_label(x) for x in (i.get("eps") or [])]
+            eps = ("  " + ", ".join(_e)) if _e else ""
+            # Alternate settings are separate interface descriptors sharing a number.
+            # Say which, or an audio interface looks like a duplicate of itself.
+            alt = f" alt{i['alt']}" if str(i.get("alt", "0")) != "0" else ""
+            p(f"                 {C['C']}if{i.get('num')}{alt}{C['N']} class 0x{c:02x} {nm:16s}"
               f" sub={i.get('sub')} proto={i.get('proto')}{eps}{extra}")
 
     th = usbinfo.threats(d)
@@ -362,6 +388,188 @@ def _start_capture(vp, d, q, stop, target=None):
     t.start()
     return t, mine, vp
 
+def do_verbose(spec):
+    """Everything in a device's descriptors, decoded, with every byte accounted for.
+
+    The bar here is `lsusb -v`, which prints the same bytes. What this adds:
+      - class-specific descriptors are counted and named rather than dumped raw
+      - alternate settings are shown as themselves, not collapsed
+      - the HID report descriptor is DECODED, not hex
+      - what only the kernel knows: physical port, removable, quirks, live drivers
+      - a byte count, so you can see nothing was skipped
+    """
+    d = usbinfo.sysfs_for(spec)
+    if not d:
+        p(f"\n  {C['R']}no device matches {spec}{C['N']}"); return 1
+    try:
+        with open(os.path.join(d, "descriptors"), "rb") as fh:
+            blob = fh.read()
+    except OSError as e:
+        p(f"\n  {C['R']}cannot read descriptors: {e}{C['N']}"); return 1
+
+    x = usbinfo.rules.parse_descriptors(blob)
+    dev = usbinfo.descriptors(spec)
+    addr = usbinfo.addr_of(d)
+    p()
+    p(f"  {C['W']}{addr}{C['N']}  {C['W']}{x.get('id','?')}{C['N']}  "
+      f"{C['D']}{dev.get('product') or '(no product string)'}{C['N']}")
+    rule()
+
+    # ---- device -----------------------------------------------------------------
+    p(f"  {C['C']}device{C['N']}")
+    cls = usbinfo._i(x.get("dev_class"))
+    clsname = "per-interface" if cls == 0 else usbinfo.CLASSES.get(cls, "?")
+    rows = [("usb", f"{x.get('usb_version')}  {usbinfo.speed_name(dev.get('speed'))}"),
+            ("class", f"0x{cls:02x}  {clsname}"),
+            ("ep0 max packet", f"{x.get('ep0_size')} bytes"),
+            ("revision", x.get("bcd_device")),
+            ("configurations", x.get("n_configs"))]
+    for k in ("manufacturer", "product", "serial"):
+        if dev.get(k): rows.append((k, dev[k]))
+    att = usbinfo.attachment(dev.get("removable"))
+    if att: rows.append(("port", att))
+    loc = usbinfo.port_location(d)
+    if loc: rows.append(("physical", loc))
+    qk = usbinfo.quirk_names(dev.get("quirks"))
+    rows.append(("kernel quirks", ", ".join(qk) if qk else "none"))
+    if dev.get("drivers"): rows.append(("drivers bound", " ".join(dev["drivers"])))
+    note = usbinfo.link_note(x.get("usb_version"), dev.get("speed"))
+    if note: rows.append(("link", note))
+    for k, v in rows:
+        if v: p(f"      {C['D']}{k:<16}{C['N']} {v}")
+
+    # ---- configurations ---------------------------------------------------------
+    for cfg in x.get("configs", []):
+        pw = usbinfo.power_claim(cfg.get("cfg_attrs")) or {}
+        p()
+        p(f"  {C['C']}configuration {cfg.get('value')}{C['N']}  {C['D']}"
+          f"{cfg.get('n_interfaces')} interfaces, {cfg.get('max_power')}, "
+          f"{'self-powered' if pw.get('self_powered') else 'bus-powered'}"
+          f"{', remote wakeup' if pw.get('remote_wakeup') else ''}{C['N']}")
+        for a in x.get("associations", []):
+            p(f"      {C['D']}association: interfaces {a['first']}+{a['count']} "
+              f"act as one function (class 0x{usbinfo._i(a['cls']):02x}){C['N']}")
+        for i in x.get("interfaces", []):
+            if cfg.get("value") and i.get("config") not in (None, cfg.get("value")):
+                continue
+            ic = usbinfo._i(i.get("cls"))
+            nm = usbinfo.CLASSES.get(ic, "?")
+            neps = len(i.get("eps") or [])
+            p(f"      {C['C']}if{i['num']} alt{i['alt']}{C['N']}  0x{ic:02x} {nm:14s} "
+              f"{C['D']}sub={i.get('sub')} proto={i.get('proto')}  "
+              f"{neps} endpoint{'' if neps == 1 else 's'}{C['N']}")
+            for e in i.get("eps") or []:
+                p(f"          {C['D']}{usbinfo.endpoint_label(e, verbose=True)}{C['N']}")
+            ex = i.get("extra") or []
+            if ex:
+                by = {}
+                for r in ex: by[r["name"]] = by.get(r["name"], 0) + 1
+                summ = ", ".join(f"{v}x {k}" if v > 1 else k for k, v in sorted(by.items()))
+                p(f"          {C['D']}+ {summ}{C['N']}")
+            rd = (dev.get("report_descriptors") or {}).get(str(i.get("num")))
+            if rd:
+                pr = usbinfo.rules.parse_report_descriptor(rd)
+                caps = usbinfo.rules.describe_capability(pr)
+                p(f"          {C['M']}report descriptor{C['N']} {C['D']}{len(rd)} bytes: "
+                  f"declares {', '.join(caps) or 'no input reports'}{C['N']}")
+
+    # ---- what it claims ----------------------------------------------------------
+    th = usbinfo.threats(dev)
+    if th:
+        p()
+        p(f"  {C['C']}claims{C['N']}")
+        for lvl, headline, why in th:
+            col = C['R'] if lvl == "HIGH" else (C['Y'] if lvl == "MED" else C['D'])
+            p(f"      {col}[{lvl}]{C['N']} {headline}")
+            p(f"             {C['D']}{why}{C['N']}")
+
+    # ---- the receipt -------------------------------------------------------------
+    p()
+    ok = x["parsed_bytes"] == x["total_bytes"] and not x["truncated"]
+    col = C['G'] if ok else C['Y']
+    p(f"  {col}{x['parsed_bytes']}/{x['total_bytes']} bytes{C['N']} {C['D']}in "
+      f"{x['descriptor_count']} descriptors"
+      f"{', all accounted for' if ok else ', SOME NOT PARSED'}{C['N']}")
+    p()
+    return 0
+
+
+def do_hid(spec, porc=False):
+    """Dump what a HID interface declares it can send.
+
+    The report descriptor is normally read as part of a verdict. This exposes it on its
+    own, because "what reports does this thing produce" is the first question when
+    working out how to talk to a controller, a foot pedal or a barcode scanner -- and it
+    has nothing to do with whether the device is trustworthy.
+
+    Needs the interface to have no driver bound: the kernel returns EBUSY for a control
+    transfer aimed at an interface a driver owns. Which is the state the airlock creates,
+    so --paranoid in another terminal is the way to read a device the system has claimed.
+    """
+    if not protect.is_root():
+        p(f"  {C['R']}needs root{C['N']}  {C['D']}reading a descriptor is a usbfs control transfer{C['N']}")
+        return 1
+    d = usbinfo.sysfs_for(spec)
+    if not d:
+        if porc: porcelain("hid", spec=spec, error="no such device")
+        else: p(f"\n  {C['R']}no device matches {spec}{C['N']}")
+        return 1
+    addr = usbinfo.addr_of(d)
+    hits = 0
+    if not porc:
+        p(); p(f"  {C['W']}{addr}{C['N']}  {C['D']}HID report descriptors{C['N']}"); rule()
+    for i in sorted(glob.glob(os.path.join(d, "*:*"))):
+        if usbinfo._attr(i, "bInterfaceClass") != "03":
+            continue
+        num = usbinfo._attr(i, "bInterfaceNumber")
+        try: num_i = int(num, 16)
+        except (TypeError, ValueError): continue
+        drv = os.path.join(i, "driver")
+        if os.path.exists(drv):
+            held = os.path.basename(os.path.realpath(drv))
+            if porc: porcelain("hid", addr=addr, iface=num_i, error="claimed by " + held)
+            else: p(f"  if{num_i}  {C['Y']}cannot read{C['N']}  {C['D']}{held} holds this interface. "
+                    f"Run a monitor with --paranoid, or unbind it{C['N']}")
+            hits += 1
+            continue
+        raw = capmod.report_descriptor(addr, num_i)
+        if not raw:
+            if porc: porcelain("hid", addr=addr, iface=num_i, error="no descriptor returned")
+            else: p(f"  if{num_i}  {C['D']}no report descriptor returned{C['N']}")
+            hits += 1
+            continue
+        parsed = usbinfo.rules.parse_report_descriptor(raw)
+        caps = usbinfo.rules.describe_capability(parsed)
+        if porc:
+            porcelain("hid", addr=addr, iface=num_i, bytes=len(raw),
+                      pages=",".join("0x%04x" % x for x in parsed["pages"]) or "-",
+                      declares=",".join(caps) or "-",
+                      truncated=int(bool(parsed["truncated"])))
+            for lvl, headline, _why in usbinfo.rules.capability_threats(parsed):
+                porcelain("hid_threat", addr=addr, iface=num_i, level=lvl, claim=headline)
+        else:
+            p(f"  {C['C']}if{num_i}{C['N']}  {C['D']}{len(raw)} bytes{C['N']}")
+            p(f"      {C['W']}declares{C['N']}  {', '.join(caps) or 'no input reports'}")
+            if parsed["pages"]:
+                p(f"      {C['D']}pages     {', '.join(usbinfo.rules.page_name(x) for x in parsed['pages'])}{C['N']}")
+            if parsed["truncated"]:
+                p(f"      {C['Y']}truncated{C['N']}  {C['D']}the descriptor does not fully decode{C['N']}")
+            for lvl, headline, why in usbinfo.rules.capability_threats(parsed):
+                col = C['R'] if lvl == "HIGH" else C['Y']
+                p(f"      {col}[{lvl}]{C['N']} {headline}")
+                p(f"             {C['D']}{why}{C['N']}")
+            # the raw bytes, because anyone reverse engineering one wants them
+            hexs = " ".join("%02x" % b for b in raw)
+            for off in range(0, len(hexs), 96):
+                p(f"      {C['D']}{hexs[off:off+96]}{C['N']}")
+        hits += 1
+    if not hits:
+        if porc: porcelain("hid", addr=addr, error="no HID interfaces")
+        else: p(f"  {C['D']}no HID interfaces on this device{C['N']}")
+    if not porc: p()
+    return 0
+
+
 def do_forget(porc=False):
     """Clear the shared allow list.
 
@@ -532,7 +740,7 @@ def do_list(a):
             continue                       # an interface dir, not a device
         bus, dev = usbinfo._attr(d, "busnum"), usbinfo._attr(d, "devnum")
         drivers, iclass = [], []
-        for i in sorted(_g.glob(os.path.join(d, "*:*"))):
+        for i in sorted(glob.glob(os.path.join(d, "*:*"))):
             c = usbinfo._attr(i, "bInterfaceClass")
             if c: iclass.append(c)
             drv = os.path.join(i, "driver")
@@ -648,6 +856,10 @@ def main():
                     help="every device with its low-level addresses, then exit")
     ap.add_argument("--attach", action="store_true",
                     help="watch a monitor that is already running, read-only")
+    ap.add_argument("--verbose", "-v", metavar="ADDR",
+                    help="every descriptor of one device, decoded, then exit")
+    ap.add_argument("--hid", metavar="ADDR",
+                    help="dump the HID report descriptors of one device, then exit")
     ap.add_argument("--forget", action="store_true",
                     help="clear the shared allow list, then exit")
     ap.add_argument("--force", action="store_true",
@@ -699,6 +911,8 @@ def main():
               + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
               + f"{C['N']}")
         return 0 if done else 1
+    if a.verbose: return do_verbose(a.verbose)
+    if a.hid: return do_hid(a.hid, a.porcelain)
     if a.forget: return do_forget(a.porcelain)
     if a.replay: return do_replay(a, a.replay)
     if a.list_devices: return do_list(a)

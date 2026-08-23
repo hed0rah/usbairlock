@@ -20,6 +20,8 @@ sudo ./usbairlock --auto -q     # same, trusting and hiding what is already plug
 ./usbairlock --observe          # watch only, change nothing, no root
 sudo ./usbairlock --paranoid    # every protection on
 ./usbairlock --status           # what is withheld right now
+./usbairlock --list             # the device tree, with real addresses
+sudo ./usbairlock --verbose ADDR  # every descriptor of one device, decoded
 ```
 
 Run it in a spare terminal and plug something in. Arrivals print with their descriptors,
@@ -216,23 +218,6 @@ monitor, which is root. So replaying a log usually needs `sudo`:
 sudo ./usbairlock --replay /tmp/triage.jsonl
 ```
 
-## the allow list persists
-
-`--authorize` writes to `/run/usbairlock/allow`, which is how it reaches a monitor in
-another terminal. `/run` is tmpfs, so that list survives every monitor restart until the
-machine reboots. A later `--paranoid` run will leave those devices alone without being
-asked twice, which is the point but is easy to forget:
-
-```sh
-sudo ./usbairlock --forget      # clear it
-```
-
-The monitor names the carried-over devices at startup rather than counting them, because
-a bare count was the only warning that a HIGH device would not be captured this session.
-
-`--forget` does not un-trust a device in a monitor that is already running: it holds its
-allow set in memory and only ever adds. Restart the monitor to pick up a clear.
-
 ## what a device declares it can send
 
 A class code is a claim about category: *I am a HID*. The **report descriptor** is a
@@ -269,14 +254,114 @@ logical ranges. It never raises on malformed input, because a hostile device is 
 the thing that sends a truncated descriptor, and reporting nothing would hand it the
 outcome it wanted -- a descriptor that will not decode is itself flagged.
 
-## the keystroke cannot escape
+## what is knowable before anything binds
+
+Everything below is populated by the kernel at enumeration, so it is all readable from a
+device the gate is holding -- before a driver exists for it.
+
+```
+usb=2.01  speed=480  power=500mA  configs=1  authorized=1  bus-powered  rev=8179
+port: internal, soldered to this machine
+```
+
+| field | what it tells you |
+| --- | --- |
+| `rev=` | `bcdDevice`, the device revision. Clones and relabelled parts often differ here from the genuine article even when VID:PID matches |
+| `bus-powered` / `self-powered` | `bmAttributes`. A **claim**, and hubs lie about it: one asserting self-powered with no supply makes the kernel allow a full load per port, and the devices behind it brown out with nothing logged |
+| `port:` | `removable` from firmware. `internal, soldered` means no human plugged it in -- that is your built-in webcam, not something that arrived |
+| `kernel quirks` | the kernel has named workarounds registered against this exact hardware. Decoded to the names in `include/linux/usb/quirks.h` |
+| `slow link` | a USB 3 device that negotiated below SuperSpeed: a 2.0 cable, a 2.0 port, or a 2.0 hub in the chain |
+| `ep3 IN` | endpoint addresses and direction, per interface |
+
+The link note is deliberately narrow. Almost every device running below its declared
+version is doing so on purpose -- a Bluetooth adapter declaring USB 2.01 and running at
+12 Mb/s has no use for High Speed. Flagging that would bury the one case that means
+something.
+
+## --verbose: every byte, decoded
+
+```sh
+sudo ./usbairlock --verbose 1-5
+```
+
+```
+  1-5  0bda:5538  Integrated_Webcam_HD
+  ------------------------------------------------------------------
+  device
+      usb              2.01  High Speed (480 Mb/s)
+      class            0xef  misc
+      revision         8179
+      port             internal, soldered to this machine
+      physical         upper left top panel (not used)
+      kernel quirks    none
+      drivers bound    uvcvideo
+
+  configuration 1  2 interfaces, 500mA, bus-powered
+      association: interfaces 0+2 act as one function (class 0x0e)
+      if0 alt0  0x0e video   sub=1 proto=0  1 endpoint
+          ep3 IN int  32B  every 6 frames
+          + class-specific endpoint, 7x class-specific interface
+      if1 alt1  0x0e video   sub=2 proto=0  1 endpoint
+          ep1 IN iso  128B  every 1 frame
+      if1 alt3  0x0e video   sub=2 proto=0  1 endpoint
+          ep1 IN iso  1024B  every 1 frame
+
+  778/778 bytes in 46 descriptors, all accounted for
+```
+
+`lsusb -v` prints the same bytes. What this adds:
+
+- **the last line.** Every descriptor is length-prefixed, so it is possible to prove
+  nothing was skipped. Tools that print only what they recognise cannot tell you what
+  they ignored.
+- **alternate settings as themselves.** Those `if1 alt1` / `alt3` lines with different
+  packet sizes are a webcam's bandwidth tiers for different resolutions.
+- **interface associations**, which is what makes a webcam's control and streaming
+  interfaces one logical device rather than two unrelated ones.
+- **the HID report descriptor decoded**, not dumped as hex.
+- **what only the kernel knows**: physical port from ACPI, whether the port is
+  user-accessible at all, registered kernel quirks, live driver bindings.
+- class-specific descriptors counted and named rather than printed raw.
+
+## reading a HID device on its own terms
+
+The report descriptor is normally read as part of a verdict, but "what reports does this
+thing actually produce" is the first question when working out how to talk to a game
+controller, a foot pedal or a barcode scanner -- and it has nothing to do with trust.
+
+```
+$ sudo ./usbairlock --hid 1-4.4.1
+
+  1-4.4.1  HID report descriptors
+  ------------------------------------------------------------------
+  if3  62 bytes
+      declares  consumer, telephony
+      pages     telephony, consumer
+      05 0c 09 01 a1 01 15 00 25 01 09 e9 09 ea 09 b5 09 b6 75 01 ...
+```
+
+Raw bytes included, because anyone reverse engineering one wants them.
+
+The interface must have **no driver bound** -- the kernel returns `EBUSY` for a control
+transfer aimed at an interface a driver owns, and the tool says which driver is holding
+it rather than failing vaguely. Running a monitor with `--paranoid` in another terminal
+puts the device in exactly the state this needs.
+
+## the guarantees
+
+Five properties the tool has to hold, and what enforces each. They are grouped because
+they are one argument: a device you do not trust must not be able to act, to lie about
+itself, or to leave your machine worse than it found it.
+
+### the keystroke cannot escape
 
 To read an interface through usbfs you have to authorize it, and authorizing it also
-makes it eligible for `usbhid`. Detaching the driver afterwards shortens that window; it
-does not close it. On 2026-08-22 a key held down across a re-enumeration produced a
-character in the operator's terminal, from a keyboard this tool was holding.
+makes it eligible for `usbhid`. Detaching the driver afterwards only shortens that
+window -- a key held down across a re-enumeration can still reach your session through
+it.
 
-`prepare()` now suspends bus-wide driver auto-binding before authorizing anything:
+So the driver gate is shut before the authorization gate opens. `prepare()` suspends
+bus-wide driver auto-binding first:
 
 ```
 /sys/bus/usb/drivers_autoprobe -> 0
@@ -291,7 +376,7 @@ interface is *registered* -- restoring it does not retroactively bind anything.
 
 Not `modprobe -r usbhid`: that is global and would take out the operator's own keyboard.
 
-## what "reversible" has to mean
+### what "reversible" has to mean
 
 Every protection is released on exit, and for the driver ones that means the driver is
 **rebound**, not merely stopped being blocked:
@@ -303,18 +388,15 @@ usb-storage: rebound 1 interface(s)
 restored 8 kernel setting(s).
 ```
 
-Until 2026-08-22 this was false. `_driver_block(..., on=False)` returned the string
-"released" and reversed nothing, and the monitor's exit path never called it anyway --
-`restore_all()` only puts back saved sysfs values, and an unbind is not a saved value.
-So a flash drive or a USB ethernet adapter was left driverless after a clean Ctrl-C,
-until it was physically replugged. Captured devices hid it, because the capture path
-registers its own rebind and nothing else had one.
+This matters more than it sounds. Restoring the gate is not enough on its own: an unbind
+is not a saved sysfs value, so nothing replays it. A device left driverless looks
+completely healthy in `lsusb` while having no `/dev/sdX`, no network interface and no
+tty -- the same lockout this tool exists to prevent, arriving through the other door.
 
-That is the same lockout this tool exists to prevent, arriving through the other door.
-The rebind count is printed for the same reason: a restore that silently did not happen
-used to look exactly like one that did.
+The rebind count is printed rather than assumed, because a restore that silently did not
+happen reads exactly like one that did.
 
-## the device does not get to write on your terminal
+### the device does not get to write on your terminal
 
 `iProduct`, `iManufacturer`, `iSerial` and `iInterface` are chosen by the device. This
 tool prints them, logs them, and emits them as tab-separated porcelain. Raw, that is a
@@ -333,7 +415,7 @@ and stripped bytes are replaced with `?` rather than dropped -- you should be ab
 see that a device tried. `--replay` sanitizes too: a log is a file, and it can come from
 another machine or from someone who would like it rendered on your terminal.
 
-## the helper tools take argv too
+### the helper tools take argv too
 
 `tools/identify` and `tools/dump` are what you run *after* deciding you do not trust a
 device, so they get the same treatment. `dump` had the worst version of the bug in this
@@ -346,17 +428,17 @@ Both now build argv lists, a device-supplied name is reduced to a filename compo
 before it is used, and a port has to look like a real tty node and exist rather than
 merely start with `/dev/`.
 
-## running as root
+### running as root
 
 The monitor needs root to write the sysfs gates, so everything it does with an argument
 you typed has to be safe at that privilege. Arguments are passed to subprocesses as an
 argv list, never through a shell, and a `VID:PID` is validated before it is used rather
 than trusted.
 
-That is not theoretical tidiness. Until 2026-08-22 `--inspect` built an `lsusb` command
-by string interpolation with `shell=True`, so a spec containing shell metacharacters ran
-as root. `tests/test_injection.py` covers it, including a check that no `sh()` call site
-in the package interpolates a value.
+This is not theoretical tidiness: a tool you point at hardware you distrust, running as
+root, must not have a path from an argument to a shell. `tests/test_injection.py`
+enforces it -- it parses the source and asserts that exactly one place may pass a
+variable to a shell, the documented wrapper whose callers only hand it fixed strings.
 
 ## the word "authorized" means three things
 
@@ -402,15 +484,13 @@ when the device arrives rather than computed on the way out.
 stable field order, no colour and no layout. The pretty output is free to change, this is
 not.
 
-Every line is a record, including the startup banner, departures, serial nodes appearing
-and the exit line -- those used to be printed as prose into the machine stream, so a
-consumer hit unparseable lines and, because departures had no record at all, watched
-devices arrive and never leave.
+**Every** line is a record -- the startup banner, arrivals, departures, serial nodes
+appearing and going, and the exit line. Nothing is prose, so a consumer never has to skip
+lines, and live state tracked from the stream stays correct across unplugs.
 
-Every device-identifying record carries `addr`. With two devices of the same model
-attached the records were otherwise byte-identical and you could not tell which one had
-arrived. `tests/test_porcelain.py` asserts both properties, including that no record kind
-is ever emitted with two different field sets.
+Every device-identifying record carries `addr`, because two devices of the same model are
+otherwise indistinguishable. `tests/test_porcelain.py` asserts both properties, and that
+no record kind is ever emitted with two different field sets.
 
 ```
 $ ./usbairlock --inspect --porcelain
@@ -479,6 +559,23 @@ device plugged in mid-session is stuck at `authorized=0` and putting the gate ba
 does not revive it. It stays dead until it is physically replugged. Anything withheld while
 the gate was down is therefore re-authorized on exit, and only that: a device someone
 deauthorized for their own reasons is left alone.
+
+## the allow list persists
+
+`--authorize` writes to `/run/usbairlock/allow`, which is how it reaches a monitor in
+another terminal. `/run` is tmpfs, so that list survives every monitor restart until the
+machine reboots. A later `--paranoid` run will leave those devices alone without being
+asked twice, which is the point but is easy to forget:
+
+```sh
+sudo ./usbairlock --forget      # clear it
+```
+
+The monitor names the carried-over devices at startup rather than counting them, because
+a bare count was the only warning that a HIGH device would not be captured this session.
+
+`--forget` does not un-trust a device in a monitor that is already running: it holds its
+allow set in memory and only ever adds. Restart the monitor to pick up a clear.
 
 ## one monitor, many terminals
 
@@ -592,7 +689,7 @@ written yet.
 | | lines | needs | for |
 | --- | --- | --- | --- |
 | `airlock-min` | 154 | python3, one file | any box, no install, drop and run |
-| `usbairlock` | ~1900 | python3 stdlib | the full thing: protections, capture, config |
+| `usbairlock` | 1300 + 2469 | python3 stdlib | the full thing: protections, capture, descriptor parsing, config |
 
 **`airlock-min` is the whole idea in one file.** Reads sysfs directly, assesses the
 claims, watches for arrivals, and optionally holds the gates. No package, no config, no
@@ -620,6 +717,8 @@ tables. Everything Linux-specific lives elsewhere.
 | `./usbairlock --replay FILE` | render a log back. Exit 2 if anything in it scored HIGH |
 | `./usbairlock --inspect [ADDR]` | one-shot: what is attached and what it claims |
 | `./usbairlock --diagnose` | nothing appeared. Why not |
+| `sudo ./usbairlock --verbose ADDR` | every descriptor of one device, decoded, with a byte count |
+| `sudo ./usbairlock --hid ADDR` | dump the HID report descriptors: what the device declares it can send |
 | `sudo ./usbairlock --arm` / `--disarm` | apply or release protections and exit, persistently |
 | `sudo ./usbairlock --authorize VID:PID` | admit one device, and share that decision with a running monitor |
 | `sudo ./usbairlock --attach` | read-only view of a monitor already running elsewhere |
@@ -633,10 +732,18 @@ alike. See **exit status** above.
 
 Python 3 and a Linux kernel. That is all.
 
-Devices are enumerated by reading `/sys` directly, so the tool works on a minimal image
-with no `usbutils` installed, which is exactly what a triage box tends to be. `lsusb` is
-used when present for verbose interface descriptors, and its absence is reported rather
-than silently reducing everything to "nothing suspicious".
+Nothing else is needed, and that is deliberate: a triage box is exactly the machine with
+a minimal image and no `usbutils`.
+
+Devices are enumerated by reading `/sys` directly, and their full structure comes from
+`/sys/bus/usb/devices/*/descriptors` -- the raw descriptor bytes as the device sent them.
+`lsusb` reads the same bytes and prints them as text; parsing them directly means no
+subprocess, no dependency, and no losing detail in the round trip through someone else's
+output format. That file is world-readable, so the whole structural view works
+**unprivileged**. Root buys the protections and the HID report descriptor fetch, nothing
+else.
+
+`lsusb` remains a fallback for the case where the raw blob cannot be read at all.
 
 `tools/identify` and `tools/dump` are the post-airlock hardware step and do want backends
 (`esptool`, `picotool`, `dfu-util`, `pyocd`); each reports which are missing and how to
@@ -655,6 +762,7 @@ python3 tests/test_devicetext.py  # a device cannot rewrite the verdict about it
 python3 tests/test_rebind.py      # unbinding a driver is reversible, or it is the lockout
 python3 tests/test_porcelain.py   # every line is a record, and records identify a device
 python3 tests/test_hidreport.py   # what a device declares it can send, from its descriptor
+python3 tests/test_descriptors.py # the raw descriptor parser that replaced lsusb
 python3 tests/test_release.py     # allowing a device releases it, chords, protections
 ```
 
@@ -699,14 +807,17 @@ not cover.
 ## layout
 
     usbairlock   the app
-    airlock/     rules (portable, zero imports), protections, device analysis, live
-                 display, and the lock / allow list / viewer channel in ipc.py
+    airlock/     rules (portable, zero imports), protections, device analysis, HID
+                 report descriptor parsing, live display, and the lock / allow list /
+                 viewer channel in ipc.py
     airlock-min  the whole idea in one file, for a box with nothing installed
     tools/       identify and dump: the post-airlock hardware step
-    tests/       threat detection and ipc tests
-    notes/     per-family reference and the threat model
-    dumps/     firmware read out of boards, gitignored (they can be large, and they are
-               not ours to redistribute)
+    tests/       12 files: threats, ipc, restore, topology, replay, release, rebind,
+                 porcelain, injection, device text, HID and raw descriptors
+    notes/       the threat model
+    docs/        the screenshot
+    dumps/       firmware read out of boards, gitignored. They get large, and they are
+                 not ours to redistribute
 
 ## family cheatsheet
 

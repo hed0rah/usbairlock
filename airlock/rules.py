@@ -103,6 +103,149 @@ def decode_hid_report(report, previous):
             text += ch
     return text, chords, keys
 
+# ---------------------------------------------------------------- raw descriptors
+#
+# /sys/bus/usb/devices/*/descriptors is the device descriptor followed by every
+# configuration descriptor, exactly as the device sent them. Parsing it directly removes
+# the last external dependency: lsusb is a text scrape of the same bytes, and a triage
+# box is precisely the machine that will not have usbutils installed.
+#
+# Every descriptor is length-prefixed -- bLength, bDescriptorType, payload -- so the walk
+# is the same shape as the HID report parser: read a length, dispatch on a type, advance.
+# Unknown types are skipped by their own length rather than aborting the walk, which is
+# what lets class-specific descriptors (audio, CDC, HID) pass through harmlessly.
+
+DESC_DEVICE, DESC_CONFIG, DESC_STRING = 0x01, 0x02, 0x03
+DESC_INTERFACE, DESC_ENDPOINT = 0x04, 0x05
+DESC_IFACE_ASSOC, DESC_HID, DESC_SS_EP_COMP = 0x0B, 0x21, 0x30
+
+EP_TYPES = {0: "control", 1: "isochronous", 2: "bulk", 3: "interrupt"}
+
+# Names for every descriptor type that turns up in a configuration blob. lsusb -v prints
+# these raw when it does not recognise them; naming them is most of the value.
+DESC_NAMES = {
+    0x01: "device", 0x02: "configuration", 0x03: "string", 0x04: "interface",
+    0x05: "endpoint", 0x06: "device qualifier", 0x07: "other-speed configuration",
+    0x08: "interface power", 0x09: "OTG", 0x0A: "debug",
+    0x0B: "interface association", 0x0F: "BOS", 0x10: "device capability",
+    0x21: "HID", 0x22: "HID report", 0x23: "HID physical",
+    0x24: "class-specific interface", 0x25: "class-specific endpoint",
+    0x29: "hub", 0x2A: "SuperSpeed hub", 0x30: "SuperSpeed endpoint companion",
+    0x31: "SuperSpeedPlus isochronous companion",
+}
+
+
+def descriptor_name(t):
+    return DESC_NAMES.get(t, "unknown 0x%02x" % t)
+
+
+def _u16(b, i):
+    return b[i] | (b[i + 1] << 8)
+
+
+def parse_descriptors(blob):
+    """Structure of a device, straight from its own descriptor bytes.
+
+    Returns the same shape `descriptors()` built from lsusb, plus endpoint detail lsusb's
+    text output made awkward to get: transfer type, max packet size, interval, and
+    alternate settings kept distinct instead of collapsed.
+
+    Never raises. A device controls these bytes, and a truncated or malformed blob is
+    exactly what a hostile one would send; the walk stops and reports what it got.
+    """
+    out = {"interfaces": [], "configs": [], "truncated": False,
+           "total_bytes": 0, "parsed_bytes": 0, "descriptor_count": 0}
+    if not blob:
+        return out
+    b = bytes(blob)
+    n = len(b)
+    out["total_bytes"] = n
+    i = 0
+    cur_cfg = None
+    while i < n:
+        if i + 2 > n:
+            out["truncated"] = True
+            break
+        ln, typ = b[i], b[i + 1]
+        # A zero length would not advance, and a length past the end is a lie. Either
+        # way the rest is unreadable; stop rather than loop or guess.
+        if ln < 2 or i + ln > n:
+            out["truncated"] = True
+            break
+        d = b[i:i + ln]
+
+        if typ == DESC_DEVICE and ln >= 18:
+            out["usb_version"] = "%x.%02x" % (d[3], d[2])
+            out["dev_class"] = str(d[4])
+            out["dev_sub"] = str(d[5])
+            out["dev_proto"] = str(d[6])
+            out["ep0_size"] = str(d[7])
+            out["id"] = "%04x:%04x" % (_u16(d, 8), _u16(d, 10))
+            out["bcd_device"] = "%04x" % _u16(d, 12)
+            out["n_configs"] = str(d[17])
+        elif typ == DESC_CONFIG and ln >= 9:
+            # bMaxPower is in 2mA units, except at SuperSpeed where it is 8mA.
+            ss = str(out.get("usb_version", "")).startswith("3")
+            cur_cfg = {
+                "value": str(d[5]),
+                "n_interfaces": str(d[4]),
+                "cfg_attrs": "%02x" % d[7],
+                "max_power": "%dmA" % (d[8] * (8 if ss else 2)),
+            }
+            out["configs"].append(cur_cfg)
+        elif typ == DESC_INTERFACE and ln >= 9:
+            out["interfaces"].append({
+                "num": str(d[2]),
+                "alt": str(d[3]),
+                "n_eps": str(d[4]),
+                "cls": str(d[5]),
+                "sub": str(d[6]),
+                "proto": str(d[7]),
+                "eps": [],
+                "config": (cur_cfg or {}).get("value"),
+            })
+        elif typ == DESC_IFACE_ASSOC and ln >= 8:
+            # Groups several interfaces into one logical function: a webcam's control
+            # and streaming interfaces, a headset's audio in and out. Without it a
+            # multi-function device reads as several unrelated things.
+            out.setdefault("associations", []).append({
+                "first": str(d[2]), "count": str(d[3]),
+                "cls": str(d[4]), "sub": str(d[5]), "proto": str(d[6]),
+            })
+        elif typ == DESC_ENDPOINT and ln >= 7:
+            if out["interfaces"]:
+                out["interfaces"][-1]["eps"].append({
+                    "addr": "0x%02x" % d[2],
+                    "dir": "IN" if d[2] & 0x80 else "OUT",
+                    "num": str(d[2] & 0x0F),
+                    "type": EP_TYPES.get(d[3] & 0x03, "?"),
+                    "max_packet": str(_u16(d, 4) & 0x07FF),
+                    "interval": str(d[6]),
+                })
+        else:
+            # Everything else is kept rather than dropped: class-specific descriptors
+            # carry the actual shape of an audio or CDC function, and a HID descriptor
+            # names the report descriptor's length. Recording what was there, and where,
+            # is what lets --verbose account for every byte of the blob.
+            rec = {"type": typ, "name": descriptor_name(typ), "len": ln, "at": i,
+                   "raw": d.hex()}
+            if out["interfaces"]:
+                out["interfaces"][-1].setdefault("extra", []).append(rec)
+            else:
+                out.setdefault("extra", []).append(rec)
+        out["parsed_bytes"] += ln
+        out["descriptor_count"] += 1
+        i += ln
+
+    # The first configuration is the one reported at the top level, matching what the
+    # kernel exposes in sysfs and what lsusb prints without --verbose.
+    if out["configs"]:
+        out.setdefault("cfg_attrs", out["configs"][0]["cfg_attrs"])
+        out.setdefault("max_power", out["configs"][0]["max_power"])
+        out.setdefault("n_interfaces", out["configs"][0]["n_interfaces"])
+    return out
+
+
 # ---------------------------------------------------------------- report descriptors
 #
 # A HID report descriptor is the device's own declaration of what it can SEND. The class
