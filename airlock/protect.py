@@ -8,6 +8,10 @@ whatever we were defending against.
 import atexit, glob, os, signal, subprocess
 
 ROOTS = "/sys/bus/usb/devices/usb*"
+# Base paths as constants so they can be pointed at a fake tree in tests. Building
+# them inline meant the only way to test the unbind logic was against real sysfs.
+DEVICES = "/sys/bus/usb/devices"
+DRIVERS = "/sys/bus/usb/drivers"
 _saved = {}          # path -> original contents
 _applied = []        # human-readable list of what is active
 
@@ -57,31 +61,66 @@ SKIP = set()          # vid:pid values that must never be touched (the startup b
 def _dev_id_for_interface(iface_name):
     """1-1:1.0 -> the parent device's vid:pid"""
     parent = iface_name.split(":")[0]
-    d = "/sys/bus/usb/devices/%s/" % parent
+    d = os.path.join(DEVICES, parent) + os.sep
     v, p = _read(d + "idVendor"), _read(d + "idProduct")
     return "%s:%s" % (v, p) if v and p else None
 
-def _driver_block(driver, on=True):
-    """Unbind everything from a driver and stop it binding anything new.
+# What each driver was holding when we unbound it. Without this, releasing a driver
+# protection did nothing at all: the on=False branch returned the string "released" and
+# reversed NOTHING, so a device merely unbound -- a flash drive, a USB ethernet adapter,
+# a dev board -- stayed driverless after the tool exited, until it was physically
+# replugged. That is the same lockout this program exists to prevent, arriving by the
+# other door, and it was false advertising in the one sentence the README leads with.
+#
+# Captured devices looked fine only because prepare() registers its own rebind. Nothing
+# else had one.
+_UNBOUND = {}
 
-    bind/unbind live in sysfs, so this needs no modprobe config and reverses cleanly.
-    Devices in SKIP are left bound: unbinding the operator's own keyboard mid-session is
-    not a protection, it is a lockout.
+def _driver_block(driver, on=True):
+    """Unbind everything from a driver, and put it back when released.
+
+    bind/unbind live in sysfs, so this needs no modprobe config. Devices in SKIP are left
+    bound: unbinding the operator's own keyboard mid-session is not a protection, it is a
+    lockout.
     """
-    base = f"/sys/bus/usb/drivers/{driver}"
+    base = os.path.join(DRIVERS, driver)
     if not os.path.isdir(base):
         return 0, f"{driver} not loaded, nothing to block"
     n = 0
     if on:
-        for dev in glob.glob(os.path.join(base, "*:*")):
+        for dev in sorted(glob.glob(os.path.join(base, "*:*"))):
             name = os.path.basename(dev)
             if _dev_id_for_interface(name) in SKIP:
                 continue
             try:
-                open(os.path.join(base, "unbind"), "w").write(name); n += 1
+                open(os.path.join(base, "unbind"), "w").write(name)
+                _UNBOUND.setdefault(driver, []).append(name)
+                n += 1
             except Exception:
                 pass
-    return n, (f"{driver}: unbound {n} existing interface(s)" if on else f"{driver}: released")
+        return n, f"{driver}: unbound {n} existing interface(s)"
+
+    # release: rebind what we took, newest first.
+    held = _UNBOUND.pop(driver, [])
+    gone = 0
+    for name in reversed(held):
+        # An interface that no longer exists is a device that left, not a failure. It is
+        # counted SEPARATELY: folding it into the rebind count reports a rebind that did
+        # not happen, which is the exact confusion this whole message exists to prevent.
+        if not os.path.exists(os.path.join(DEVICES, name)):
+            gone += 1
+            continue
+        try:
+            open(os.path.join(base, "bind"), "w").write(name)
+            n += 1
+        except Exception:
+            pass
+    if not held:
+        return 0, f"{driver}: released"
+    msg = f"{driver}: rebound {n} interface(s)"
+    if gone:
+        msg += f", {gone} gone with the device"
+    return n, msg
 
 def unbind_hid(on=True):
     """usbhid is what turns a claimed keyboard into keystrokes in your session."""
@@ -97,6 +136,26 @@ def unbind_net(on=True):
         total += n
         if "not loaded" not in m: msgs.append(m)
     return total, "; ".join(msgs) or "no USB network drivers loaded"
+
+def unbind_serial(on=True):
+    """Refuse USB serial drivers.
+
+    The gap this fills, found 2026-08-22: an ESP32-C3 already attached when the monitor
+    started kept cdc_acm bound and its /dev/ttyACM0 live, while an already-attached
+    keyboard was stripped by unbind_hid. Same situation, opposite treatment, purely
+    because nothing in the registry covered CDC.
+
+    It matters beyond tidiness. A device claiming CDC-ACM gets a tty the moment it is
+    plugged in, and the `option` driver in particular binds cellular modems, which is
+    the same DNS-and-routing takeover unbind_net exists to stop -- just arriving over a
+    serial interface instead of an ethernet one.
+    """
+    total, msgs = 0, []
+    for d in ("cdc_acm", "ftdi_sio", "ch341", "cp210x", "pl2303", "option", "usbserial"):
+        n, m = _driver_block(d, on)
+        total += n
+        if "not loaded" not in m: msgs.append(m)
+    return total, "; ".join(msgs) or "no USB serial drivers loaded"
 
 def usbfs_snoop(on=True):
     """usbfs_snoop dumps raw USB traffic to the kernel log. Very loud, very low-level."""
@@ -121,9 +180,32 @@ REGISTRY = {
         "drivers/usb-storage/unbind: no mass-storage autoprobe"),
     "unbind_net":         (unbind_net,
         "unbinds cdc_ether, rndis_host and friends: no DNS or route hijack"),
+    "unbind_serial":      (unbind_serial,
+        "unbinds cdc_acm, ftdi_sio and friends: no tty appears for an unknown device"),
     "usbfs_snoop":        (usbfs_snoop,
         "usbcore.usbfs_snoop=Y: raw USB traffic into the kernel ring buffer"),
 }
+
+def release(names=None):
+    """Turn protections back off. Returns [(name, detail)] for what was released.
+
+    The gates are also covered by _saved, but the driver unbinds are not: nothing else
+    knows which interfaces were taken. Until this existed the monitor's exit restored
+    authorized_default and left every unbound driver detached, so a flash drive or a USB
+    ethernet adapter stayed dead after a clean Ctrl-C.
+    """
+    out = []
+    for name in (names if names is not None else list(reversed(_applied))):
+        fn = REGISTRY.get(name, (None, None))[0]
+        if fn is None:
+            continue
+        try:
+            _n, detail = fn(False)
+            out.append((name, detail))
+        except Exception as e:
+            out.append((name, "release failed: %s" % e))
+    return out
+
 
 def apply(cfg_protections):
     """Returns [(name, enabled, ok, detail)] for reporting."""
@@ -184,8 +266,36 @@ def add_cleanup(fn):
     """
     _cleanups.append(fn)
 
+EXIT_CODE = [0]
+
+def set_exit_code(n):
+    """What the process should exit with when a signal takes it down.
+
+    The monitor only ever leaves through a signal handler, and that path calls
+    os._exit, which ignores whatever main() would have returned. Without somewhere
+    to put this, a session that caught a HIGH device still exits 0 and no script can
+    tell. 2 matches --inspect, which already uses it for the same meaning.
+    """
+    EXIT_CODE[0] = max(EXIT_CODE[0], int(n))
+
+
 def install_handlers(on_exit=None):
     def _bye(signum=None, frame=None):
+        # Release driver protections FIRST. A rebind needs the interface to exist and be
+        # authorized, which is true for everything that was present when we unbound it,
+        # and doing it here means a captured device's own rebind (registered in
+        # _cleanups) is not fighting this one.
+        try:
+            for _name, _detail in release():
+                # Say it. "restored N kernel setting(s)" counts sysfs values and says
+                # nothing about drivers, so a rebind that silently did not happen looked
+                # exactly like one that did -- which is how this shipped broken.
+                if "rebound" in _detail or "failed" in _detail:
+                    try: print("  %s" % _detail, flush=True)
+                    except Exception: pass
+        except Exception as e:
+            try: print("  release failed: %s" % e, flush=True)
+            except Exception: pass
         for fn in reversed(_cleanups):
             try:
                 fn()
@@ -196,7 +306,7 @@ def install_handlers(on_exit=None):
                 except Exception: pass
         n = restore_all()
         if on_exit: on_exit(n)
-        if signum: os._exit(0)
+        if signum: os._exit(EXIT_CODE[0])
     atexit.register(_bye)
     for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try: signal.signal(s, _bye)

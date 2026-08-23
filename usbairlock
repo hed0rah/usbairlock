@@ -15,11 +15,12 @@ the same kernel settings. From any other terminal:
 
     sudo ./usbairlock --attach           watch the running monitor, read-only
     sudo ./usbairlock --authorize VID:PID  admit a device, and tell the monitor to trust it
+    sudo ./usbairlock --forget           clear the allow list (it persists in /run)
 
 Every protection is reversible and is restored when this exits, including on Ctrl-C
 or a kill.
 """
-import argparse, glob, os, queue, re, signal, sys, threading, time
+import argparse, glob, json, os, queue, re, signal, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from airlock import config as cfgmod, protect, usbinfo, capture as capmod, live as livemod
@@ -77,7 +78,9 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
     known = usbinfo.KNOWN.get(vp, "")
     tag = f"{C['G']}{C['W']}+ ARRIVED{C['N']}" if first_seen else f"{C['D']}  present {C['N']}"
     hubtag = f" {C['B']}[HUB]{C['N']}" if d.get("is_hub") else ""
-    p(f"  {time.strftime('%H:%M:%S')}  {tag}  {C['W']}{vp}{C['N']}{hubtag}  {name or C['D']+'(no product string)'+C['N']}")
+    addr = usbinfo.addr_of(meta.get("sysfs")) if meta else d.get("addr")
+    at = f"{C['C']}{addr}{C['N']}  " if addr else ""
+    p(f"  {time.strftime('%H:%M:%S')}  {tag}  {at}{C['W']}{vp}{C['N']}{hubtag}  {name or C['D']+'(no product string)'+C['N']}")
     if d.get("authorized") == "0":
         p(f"                 {C['Y']}UNAUTHORIZED{C['N']}  {C['D']}no interface objects, so nothing can bind or be claimed.{C['N']}")
         p(f"                               {C['D']}descriptors below are still readable over control transfers{C['N']}")
@@ -121,14 +124,19 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
     p()
     return d
 
-def do_diagnose():
+def do_diagnose(porc=False):
     """Why did nothing appear? Separates the three outcomes that look identical."""
-    p(f"\n  {C['W']}diagnosis{C['N']}")
-    rule()
+    if not porc:
+        p(f"\n  {C['W']}diagnosis{C['N']}")
+        rule()
     devs = usbinfo.snapshot()
     serial = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
-    p(f"  usb devices (excluding root hubs) : {len(devs)}")
-    p(f"  serial ports                      : {' '.join(serial) or 'none'}")
+    if porc:
+        porcelain("diag", devices=len(devs), serial_ports=len(serial),
+                  serial=",".join(serial) or "none")
+    else:
+        p(f"  usb devices (excluding root hubs) : {len(devs)}")
+        p(f"  serial ports                      : {' '.join(serial) or 'none'}")
 
     # the kernel's own view is the deciding evidence
     import subprocess
@@ -141,11 +149,19 @@ def do_diagnose():
         restrict = "?"
         try: restrict = open("/proc/sys/kernel/dmesg_restrict").read().strip()
         except Exception: pass
-        p(f"  kernel log                        : {C['Y']}restricted{C['N']} (dmesg_restrict={restrict})")
-        p(f"  {C['D']}rerun with sudo to see enumeration attempts{C['N']}")
+        if porc:
+            porcelain("diag", kernel_log="restricted", dmesg_restrict=restrict)
+        else:
+            p(f"  kernel log                        : {C['Y']}restricted{C['N']} (dmesg_restrict={restrict})")
+            p(f"  {C['D']}rerun with sudo to see enumeration attempts{C['N']}")
     else:
         hits = [l for l in log.splitlines() if re.search(
             r'usb \d|new (full|high|low)-speed|device descriptor|not accepting address|over-?current|disconnect', l, re.I)][-6:]
+        if porc:
+            porcelain("diag", kernel_log="readable", usb_events=len(hits))
+            for h in hits:
+                porcelain("kmsg", line=h.strip().replace("\t", " "))
+            return 0
         if hits:
             p(f"  kernel log                        : {len(hits)} recent USB event(s)")
             for h in hits: p(f"    {C['D']}{h[-110:]}{C['N']}")
@@ -162,7 +178,7 @@ def do_diagnose():
     p()
     return 0
 
-def do_arm(cfg, disarm=False):
+def do_arm(cfg, disarm=False, porc=False):
     if not protect.is_root():
         p(f"  {C['R']}needs root{C['N']}"); return 1
     if disarm:
@@ -176,26 +192,51 @@ def do_arm(cfg, disarm=False):
         for a in glob.glob("/sys/bus/usb/devices/*/authorized"):
             try: open(a,"w").write("1")
             except Exception: pass
-        p(f"  {C['G']}GRANTED{C['N']}  authorization restored, drivers bind normally")
+        if porc: porcelain("disarm", granted=1)
+        else: p(f"  {C['G']}GRANTED{C['N']}  authorization restored, drivers bind normally")
         return 0
     results = protect.apply(cfg["protections"])
     protect._saved.clear()      # deliberately persistent: this is the one-shot mode
     for name, wanted, ok, detail in results:
-        if wanted:
+        if porc:
+            porcelain("protection", name=name, wanted=int(bool(wanted)),
+                      active=int(bool(ok)) if wanted else 0, persistent=1)
+        elif wanted:
             mark = f"{C['G']}ACTIVE{C['N']}" if ok else f"{C['R']}FAILED{C['N']}"
             p(f"  {mark}  {name:16s} {C['D']}{detail}{C['N']}")
-    p(f"  {C['Y']}these persist until you run --disarm{C['N']}")
+    if not porc:
+        p(f"  {C['Y']}these persist until you run --disarm{C['N']}")
     return 0
 
-def do_inspect(cfg, target=None):
+def do_inspect(cfg, target=None, porc=False):
     snap = usbinfo.snapshot()
-    hits = [m for m in snap.values() if not target or m["id"] == target]
+    if target:
+        # Match on ADDRESS, not just vid:pid, so two identical devices are separable.
+        want = set(usbinfo.resolve(target))
+        hits = [m for m in snap.values() if m.get("sysfs") in want]
+    else:
+        hits = list(snap.values())
     if not hits:
-        p(f"  no device matching {target or '(any)'}"); return 1
+        p(f"  no device matching {target or '(any)'}")
+        if target: p(f"  {C['D']}./usbairlock --list shows every address{C['N']}")
+        return 1
     worst = 0
     for m in hits:
-        d = show_device(m["id"], m["name"], cfg, meta=m)
-        for lvl,_,_ in usbinfo.threats(d):
+        if porc:
+            d = usbinfo.descriptors(m["id"])
+            th = usbinfo.threats(d)
+            porcelain("present", addr=usbinfo.addr_of(m.get("sysfs")), id=m["id"],
+                      name=(m.get("name") or "").replace("\t", " "),
+                      authorized=m.get("authorized"),
+                      drivers=",".join(d.get("drivers") or []) or "none",
+                      worst=usbinfo.rules.worst(set(l for l, _, _ in th)) or "none")
+            for lvl, headline, _ in th:
+                porcelain("threat", addr=usbinfo.addr_of(m.get("sysfs")),
+                          id=m["id"], level=lvl, claim=headline)
+        else:
+            d = show_device(m["id"], m["name"], cfg, meta=m)
+            th = usbinfo.threats(d)
+        for lvl, _, _ in th:
             worst = max(worst, {"LOW":1,"MED":2,"HIGH":3}[lvl])
     return 2 if worst >= 3 else 0
 
@@ -266,23 +307,47 @@ def porcelain(kind, **kw):
 def _hid_interfaces(d):
     return [i for i in d.get("interfaces", []) if usbinfo.rules.to_int(i.get("cls")) == 0x03]
 
-def _start_capture(vp, d, q, stop):
+def _drop_capture(capturing, vp, release=False):
+    """Remove every capture for a vid:pid, optionally stopping it first.
+
+    The dict is keyed by address (`1-1`) when one is resolvable and by vid:pid only as
+    a fallback, but the capture queue reports by vid:pid. Popping by vid:pid therefore
+    missed the usual case, leaked the entry, and left `(addr or vp) not in capturing`
+    permanently true so the device could never be captured again.
+    """
+    dropped = []
+    for k in [k_ for k_, v_ in capturing.items() if v_[2] == vp or k_ == vp]:
+        _t, ev, _vp = capturing.pop(k)
+        if release: ev.set()
+        dropped.append(k)
+    return dropped
+
+
+def _start_capture(vp, d, q, stop, target=None):
     """Record what a HID arrival types, in a thread, into the shared queue.
 
     Only fired for devices that actually claim HID, because prepare() removes usbhid
     globally and that is not something to do speculatively for a flash drive.
+
+    Returns (thread, mine, vp). `mine` stops just this capture: --authorize on a device
+    being captured has to release that device and nothing else, and the shared `stop`
+    event cannot express that. `vp` rides along because the dict is keyed by ADDRESS
+    while everything else refers to devices by vid:pid.
     """
     ifs = _hid_interfaces(d)
     iface = int(ifs[0].get("num", 0)) if ifs else 0
     ep = 0x81 + iface
+    mine = threading.Event()
+    halt = lambda: mine.is_set() or stop.is_set()
     def run():
         try:
             for ts, text, chords in capmod.capture_forever(
-                    vp, iface, ep,
+                    target or vp, iface, ep,
                     on_lost=lambda: q.put(("note", vp, "re-enumerated, reconnecting")),
                     on_found=lambda: q.put(("note", vp, "reattached")),
-                    on_prepared=lambda st: [q.put(("note", vp, s_)) for s_ in st]):
-                if stop.is_set(): return
+                    on_prepared=lambda st: [q.put(("note", vp, s_)) for s_ in st],
+                    should_stop=halt):
+                if halt(): return
                 if text:   q.put(("keys", vp, text))
                 for c_ in chords: q.put(("chord", vp, c_))
         except capmod.Gone as e:
@@ -295,11 +360,35 @@ def _start_capture(vp, d, q, stop):
             q.put(("err", vp, str(e)))
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    return t
+    return t, mine, vp
 
-def do_status():
-    p(f"\n  {C['W']}current state{C['N']}")
-    rule()
+def do_forget(porc=False):
+    """Clear the shared allow list.
+
+    Deliberately does NOT touch a running monitor: it already holds its allow set in
+    memory and only ever adds to it, so un-trusting a device mid-session is not a thing
+    this can honestly promise. Say so rather than implying otherwise.
+    """
+    had = ipc.forget_allow()
+    if porc:
+        for vp in sorted(had):
+            porcelain("forgot", id=vp)
+        porcelain("forget", count=len(had))
+        return 0
+    if not had:
+        p(f"\n  {C['D']}allow list was already empty.{C['N']}")
+        return 0
+    p(f"\n  {C['G']}forgot {len(had)} device(s){C['N']}  {C['W']}{' '.join(sorted(had))}{C['N']}")
+    if ipc.holder_pid():
+        p(f"  {C['Y']}a monitor is running{C['N']} {C['D']}and keeps its own copy in memory. "
+          f"restart it to pick this up.{C['N']}")
+    return 0
+
+
+def do_status(porc=False):
+    if not porc:
+        p(f"\n  {C['W']}current state{C['N']}")
+        rule()
     for r in sorted(glob.glob("/sys/bus/usb/devices/usb*")):
         dev = open(os.path.join(r,"authorized_default")).read().strip()
         ifp = os.path.join(r,"interface_authorized_default")
@@ -315,12 +404,82 @@ def do_status():
         if dev == "0":     gate = f"{C['G']}WITHHELD{C['N']} device"
         elif ifd == "0":   gate = f"{C['G']}WITHHELD{C['N']} interface"
         else:              gate = f"{C['Y']}GRANTED{C['N']}"
-        p(f"  {os.path.basename(r):6s} authorized_default={dev} "
-          f"interface_authorized_default={ifd}   {gate}")
+        if porc:
+            porcelain("gate", root=os.path.basename(r), authorized_default=dev,
+                      interface_authorized_default=ifd,
+                      withheld=int(dev == "0" or ifd == "0"))
+        else:
+            p(f"  {os.path.basename(r):6s} authorized_default={dev} "
+              f"interface_authorized_default={ifd}   {gate}")
+    if porc:
+        for _k, meta in sorted(usbinfo.snapshot().items()):
+            d0 = usbinfo.descriptors(meta["id"])
+            porcelain("present", addr=usbinfo.addr_of(meta.get("sysfs")), id=meta["id"],
+                      name=(meta.get("name") or "").replace("\t", " "),
+                      authorized=meta.get("authorized"),
+                      drivers=",".join(d0.get("drivers") or []) or "none",
+                      worst=usbinfo.rules.worst(
+                          set(l for l, _, _ in usbinfo.threats(d0))) or "none")
+        return 0
     p()
     for vp_key, meta in usbinfo.snapshot().items():
         show_device(meta["id"], meta["name"], {"monitor":{"descriptors":"summary"}})
     return 0
+
+def do_replay(a, path):
+    """Render a --log file. The journal speaks the viewer's wire format, so this is
+    do_attach's renderer pointed at a file instead of a socket.
+
+    Deliberately linear. Replaying the pinned status block would flicker a session's
+    history through one five-line box and tell you nothing; the log lines in order are
+    the record. `status` events are skipped for the same reason, they are derived state.
+    """
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError as e:
+        p(f"  {C['R']}cannot read {path}: {e}{C['N']}")
+        return 1
+    n, worst, sessions = 0, 0, 0
+    with fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try: ev = json.loads(raw)
+            except ValueError:
+                continue                      # a truncated last line is normal after a kill
+            kind = ev.get("ev")
+            n += 1
+            if a.porcelain:
+                porcelain(kind or "event", **{k: v for k, v in ev.items() if k != "ev"})
+                continue
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev.get("t", 0)))
+            if kind == "session":
+                sessions += 1
+                rule()
+                # Everything below is rendered through safe_text. A log is a file: it
+                # can come from another machine, from an older build that did not
+                # sanitize, or from an attacker. Replaying it must not hand a terminal
+                # escape sitting inside that file straight to this terminal.
+                _s = usbinfo.safe_text
+                p(f"  {C['W']}session{C['N']}  {when}  {C['D']}pid {_s(ev.get('pid','?'))}{C['N']}")
+                p(f"    {C['D']}argv       {_s(ev.get('argv',''))}{C['N']}")
+                p(f"    {C['D']}protections {_s(', '.join(ev.get('protections') or []) or 'none')}{C['N']}")
+                rule()
+            elif kind == "present":
+                w = ev.get("worst") or "none"
+                col = C['R'] if w == "HIGH" else C['Y'] if w == "MED" else C['D']
+                worst = max(worst, {"HIGH": 3, "MED": 2, "LOW": 1}.get(w, 0))
+                p(f"  {C['D']}baseline{C['N']} {usbinfo.safe_text(ev.get('addr') or '?'):<8s} {usbinfo.safe_text(ev.get('id'))}  "
+                  f"{col}{w:<5s}{C['N']} {C['D']}auth={ev.get('authorized')} "
+                  f"drivers={ev.get('drivers')}{C['N']}")
+            elif kind == "log":
+                p("  " + usbinfo.safe_text(ev.get("line", ""), limit=400))
+    if not a.porcelain:
+        p()
+        p(f"  {C['D']}{n} event(s), {sessions} session(s) from {path}{C['N']}")
+    return 2 if worst >= 3 else 0
+
 
 def do_attach(a):
     """Watch a monitor that is already running, without touching a single kernel knob."""
@@ -359,6 +518,95 @@ def do_attach(a):
     return rc
 
 
+def do_list(a):
+    """Every device on the bus with its low-level addresses. Reads sysfs, not lsusb.
+
+    Root hubs are included rather than filtered out: they are where the gates are
+    actually written, so a listing that hides them hides the thing --status changes.
+    """
+    import glob as _g
+    rows = []
+    for d in sorted(_g.glob("/sys/bus/usb/devices/*/")):
+        vid, pid = usbinfo._attr(d, "idVendor"), usbinfo._attr(d, "idProduct")
+        if not (vid and pid):
+            continue                       # an interface dir, not a device
+        bus, dev = usbinfo._attr(d, "busnum"), usbinfo._attr(d, "devnum")
+        drivers, iclass = [], []
+        for i in sorted(_g.glob(os.path.join(d, "*:*"))):
+            c = usbinfo._attr(i, "bInterfaceClass")
+            if c: iclass.append(c)
+            drv = os.path.join(i, "driver")
+            if os.path.exists(drv):
+                drivers.append(os.path.basename(os.path.realpath(drv)))
+        name = " ".join(x for x in (usbinfo._attr(d, "manufacturer"),
+                                    usbinfo._attr(d, "product")) if x)
+        rows.append({
+            "addr": usbinfo.addr_of(d),
+            "bus": f"{int(bus):03d}" if (bus or "").isdigit() else (bus or "?"),
+            "devnum": f"{int(dev):03d}" if (dev or "").isdigit() else (dev or "?"),
+            "node": (f"/dev/bus/usb/{int(bus):03d}/{int(dev):03d}"
+                     if (bus or "").isdigit() and (dev or "").isdigit() else "-"),
+            "id": f"{vid}:{pid}",
+            "class": usbinfo._attr(d, "bDeviceClass") or "00",
+            "iclass": ",".join(sorted(set(iclass))) or "-",
+            "driver": ",".join(sorted(set(drivers))) or "none",
+            "auth": usbinfo._attr(d, "authorized") or "?",
+            "hub": "1" if usbinfo._attr(d, "bDeviceClass") == "09" else "0",
+            "parent": usbinfo.parent_of(usbinfo.addr_of(d)) or "-",
+            "depth": str(usbinfo.depth_of(usbinfo.addr_of(d))),
+            "name": (name or "-").replace("\t", " "),
+        })
+
+    # A device behind an unauthorized hub is enumerated and unreachable, and nothing
+    # says so anywhere. Walk up the tree once and mark them, because "allowed it and
+    # nothing happened" is the confusing case this listing exists to explain.
+    auth_by = {r["addr"]: r["auth"] for r in rows}
+    for r in rows:
+        r["stranded"] = usbinfo.stranded_by(r["addr"], auth_by) or "-"
+        r["blind"] = "1" if usbinfo.blinds_downstream(
+            r["addr"], auth_by, r["hub"] == "1") else "0"
+
+    # parent before child, so indentation reads as the tree it is, and siblings in
+    # port order rather than string order: 1-5 belongs above 1-14, not below it.
+    rows.sort(key=lambda r: usbinfo.sort_key(r["addr"]))
+    ordered, seen_addr = [], set()
+    def walk(parent):
+        for r in rows:
+            if r["parent"] == parent and r["addr"] not in seen_addr:
+                seen_addr.add(r["addr"]); ordered.append(r); walk(r["addr"])
+    walk("-")
+    for r in rows:                       # anything orphaned by an odd name
+        if r["addr"] not in seen_addr:
+            seen_addr.add(r["addr"]); ordered.append(r)
+    rows = ordered
+    if a.porcelain:
+        for r in rows:
+            porcelain("dev", **r)
+        return 0
+    p()
+    p(f"  {C['D']}addr           bus/dev   id           ifcls   driver      auth  name{C['N']}")
+    rule()
+    for r in rows:
+        auth = f"{C['G']}1{C['N']}" if r["auth"] == "1" else f"{C['R']}0{C['N']}"
+        tag = f"{C['B']}[HUB]{C['N']} " if r["hub"] == "1" else ""
+        d0 = int(r["depth"])
+        indent = "" if d0 == 0 else ("  " * (d0 - 1)) + "\u2514 "
+        shown = (indent + r["addr"])[:14]
+        p(f"  {shown:<14s} {r['bus']}/{r['devnum']}   {C['W']}{r['id']}{C['N']}    "
+          f"{r['iclass']:<7s} {r['driver']:<11s} {auth}     {tag}{r['name'][:30]}")
+        if r["blind"] == "1":
+            p(f"  {' ' * 14} {C['Y']}opaque{C['N']} {C['D']}withheld hub: nothing behind it can "
+              f"enumerate, so this listing cannot show what is{C['N']}")
+        if r["stranded"] != "-":
+            p(f"  {' ' * 14} {C['R']}unreachable{C['N']} {C['D']}behind unauthorized hub "
+              f"{r['stranded']}, nothing below it can enumerate{C['N']}")
+    p()
+    p(f"  {C['D']}{len(rows)} device(s). address any of them by addr, bus/dev, node or id:{C['N']}")
+    example = next((r["addr"] for r in rows if r["hub"] == "0"), rows[0]["addr"] if rows else "1-1")
+    p(f"  {C['D']}  sudo ./usbairlock --inspect {example}{C['N']}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--config"); ap.add_argument("--observe", action="store_true")
@@ -392,8 +640,16 @@ def main():
                     help="no pinned status block, just scrolling output")
     ap.add_argument("--porcelain", action="store_true",
                     help="stable tab-separated records for scripts, no colour or layout")
+    ap.add_argument("--replay", metavar="FILE",
+                    help="render a --log file back, same events the viewer sees")
+    ap.add_argument("--log", metavar="FILE",
+                    help="append the event stream to FILE as ndjson, 0600")
+    ap.add_argument("--list", action="store_true", dest="list_devices",
+                    help="every device with its low-level addresses, then exit")
     ap.add_argument("--attach", action="store_true",
                     help="watch a monitor that is already running, read-only")
+    ap.add_argument("--forget", action="store_true",
+                    help="clear the shared allow list, then exit")
     ap.add_argument("--force", action="store_true",
                     help="start a second monitor anyway, even though one holds the lock")
     ap.add_argument("-h","--help", action="store_true")
@@ -420,7 +676,19 @@ def main():
 
     if a.authorize:
         if not protect.is_root(): p(f"  {C['R']}--authorize needs root{C['N']}"); return 1
-        done = protect.authorize(a.authorize)
+        hits = usbinfo.resolve(a.authorize)
+        if not hits:
+            p(f"  {C['R']}no device matching {a.authorize}{C['N']}")
+            p(f"  {C['D']}./usbairlock --list shows every address{C['N']}")
+            return 1
+        if len(hits) > 1:
+            # vid:pid names a MODEL. Say so rather than acting on one and staying quiet.
+            p(f"  {C['Y']}{a.authorize} matches {len(hits)} devices{C['N']} "
+              f"{C['D']}({', '.join(usbinfo.addr_of(h) for h in hits)}), authorizing all{C['N']}")
+            p(f"  {C['D']}address one of them instead to be specific{C['N']}")
+        done = []
+        for h in hits:
+            done += protect.authorize(path=h)
         p(f"  authorized {len(done)} device(s): {' '.join(done) or 'none matched'}")
         # Authorising writes sysfs, which a running monitor sees on its next poll.
         # The ALLOW LIST is separate: it is policy, and without recording it there the
@@ -431,12 +699,15 @@ def main():
               + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
               + f"{C['N']}")
         return 0 if done else 1
+    if a.forget: return do_forget(a.porcelain)
+    if a.replay: return do_replay(a, a.replay)
+    if a.list_devices: return do_list(a)
     if a.attach: return do_attach(a)
-    if a.status: return do_status()
-    if a.diagnose: return do_diagnose()
-    if a.disarm: return do_arm(cfg, disarm=True)
-    if a.arm: return do_arm(cfg)
-    if a.inspect: return do_inspect(cfg, None if a.inspect is True else a.inspect)
+    if a.status: return do_status(a.porcelain)
+    if a.diagnose: return do_diagnose(a.porcelain)
+    if a.disarm: return do_arm(cfg, disarm=True, porc=a.porcelain)
+    if a.arm: return do_arm(cfg, porc=a.porcelain)
+    if a.inspect: return do_inspect(cfg, None if a.inspect is True else a.inspect, a.porcelain)
     if a.capture: return do_capture(cfg, a.capture, a.iface, a.endpoint, None)
 
     # SINGLE INSTANCE. Two monitors would both apply protections and both register
@@ -462,8 +733,12 @@ def main():
             p(f"  {C['D']}watch it:  sudo ./usbairlock --attach{C['N']}")
             p(f"  {C['D']}override:  --force, only if you are sure the other one is wedged{C['N']}")
             return 1
-        p(f"  {C['Y']}--force: starting a second monitor while another holds the lock{where}.{C['N']}")
-        p(f"  {C['Y']}whichever exits first restores the shared kernel settings for both.{C['N']}")
+        if a.porcelain:
+            porcelain("forced", other_pid=(other or 0),
+                      warn="two monitors share the kernel settings; the first to exit restores them")
+        else:
+            p(f"  {C['Y']}--force: starting a second monitor while another holds the lock{where}.{C['N']}")
+            p(f"  {C['Y']}whichever exits first restores the shared kernel settings for both.{C['N']}")
 
     # Tell the protection layer what to leave alone before it unbinds anything.
     _snap0 = usbinfo.snapshot()
@@ -471,9 +746,22 @@ def main():
                    else set(a.allow_list)
     results = protect.apply(cfg["protections"]) if not a.observe else \
               [(n, False, None, d) for n,(f,d) in protect.REGISTRY.items()]
-    protect.install_handlers(lambda n: p(f"\n  {C['D']}restored {n} kernel setting(s).{C['N']}"))
+    protect.install_handlers(
+        (lambda n: porcelain("restored", settings=n)) if a.porcelain
+        else (lambda n: p(f"\n  {C['D']}restored {n} kernel setting(s).{C['N']}")))
     holder.serve()
     protect.add_cleanup(holder.close)
+    journal = None
+    if a.log:
+        journal = ipc.Journal(a.log)
+        protect.add_cleanup(journal.close)
+        if journal.reason:
+            p(f"  {C['R']}cannot log to {a.log}: {journal.reason}{C['N']}")
+            journal = None
+        else:
+            journal.write("session", path=a.log, pid=os.getpid(),
+                          protections=[n for n, w, ok, _ in results if w and ok],
+                          argv=" ".join(sys.argv[1:]))
 
     if a.porcelain:
         for name, wanted, ok, detail in results:
@@ -504,12 +792,30 @@ def main():
 
     shown = 0
     for k, m in sorted(seen.items()):
+        if journal is not None:
+            # Every device, including hidden ones. A log filtered by display preference
+            # is not a record of what was attached, and the baseline is the half of a
+            # forensic log you cannot reconstruct afterwards.
+            d0 = usbinfo.descriptors(m["id"])
+            journal.write("present", addr=usbinfo.addr_of(m.get("sysfs")), id=m["id"],
+                          name=m.get("name") or "", authorized=m.get("authorized"),
+                          hidden=bool(hide_allowed and m["id"] in allow),
+                          allowed=bool(m["id"] in allow),
+                          drivers=",".join(d0.get("drivers") or []) or "none",
+                          worst=usbinfo.rules.worst(
+                              set(l for l, _, _ in usbinfo.threats(d0))) or "none")
         if hide_allowed and m["id"] in allow:
             continue
         if a.porcelain:
             d0 = usbinfo.descriptors(m["id"])
             th = usbinfo.threats(d0)
-            porcelain("present", id=m["id"], name=(m["name"] or "").replace("\t", " "),
+            # addr first, and always. --status and --inspect already emit it on these
+            # record kinds; the monitor did not, so the SAME record name carried
+            # different fields depending on which mode produced it. With two identical
+            # devices attached the monitor's records were byte-identical and a consumer
+            # could not tell which one had arrived -- proven with two CH340 boards.
+            porcelain("present", addr=usbinfo.addr_of(m.get("sysfs")) or "-",
+                      id=m["id"], name=(m["name"] or "").replace("\t", " "),
                       drivers=",".join(d0.get("drivers") or []) or "none",
                       worst=usbinfo.rules.worst(set(l for l, _, _ in th)) or "none")
         else:
@@ -517,11 +823,27 @@ def main():
         shown += 1
     if allow:
         hid = len(seen) - shown
-        p(f"  {C['D']}allow list: {len(allow)} device(s)"
-          + (f", {hid} hidden" if hide_allowed and hid else "") + f"{C['N']}")
+        # Name them. A bare count was the only warning that a device would not be
+        # captured this session, and the list persists in /run across monitor restarts,
+        # so "allow list: 1 device(s)" was easy to read past while a HIGH keyboard sat
+        # there untouched. Say which, and say that it came from somewhere else.
+        carried = " ".join(sorted(allow))
+        p(f"  {C['Y']}allow list{C['N']} {C['D']}(persists in /run until reboot, "
+          f"clear with --forget){C['N']}")
+        p(f"    {C['W']}{carried}{C['N']}"
+          + (f"  {C['D']}{hid} hidden{C['N']}" if hide_allowed and hid else ""))
 
-    p(f"  {C['D']}watching. ctrl-c to stop and restore.{C['N']}")
-    rule()
+    # --porcelain means machine-only. These three were printed into it as prose, so
+    # anything parsing the stream hit three unparseable lines before the first record.
+    if a.porcelain:
+        if journal is not None:
+            porcelain("logging", path=a.log, mode="0600")
+        porcelain("watching", interval=cfg["monitor"]["poll_interval"])
+    else:
+        if journal is not None:
+            p(f"  {C['D']}logging to {a.log}, mode 0600. it records what devices type.{C['N']}")
+        p(f"  {C['D']}watching. ctrl-c to stop and restore.{C['N']}")
+        rule()
 
     interval = float(cfg["monitor"].get("poll_interval", 1.0))
     prev_serial = set(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
@@ -536,7 +858,7 @@ def main():
     with livemod.Pinned(height=5, enabled=not a.plain) as pin:
         # Every user-visible line already funnels through emit, so wrapping it once is
         # the whole broadcast layer. Viewers see exactly what the holder's terminal sees.
-        emit = ipc.tee(pin.log if pin.enabled else _p, holder)
+        emit = ipc.tee(pin.log if pin.enabled else _p, holder, journal)
         last_status = []
 
         def status(last=""):
@@ -568,8 +890,67 @@ def main():
                     protect.SKIP |= fresh     # so a replug is not withheld again
                     emit(f"  {time.strftime('%H:%M:%S')}  {C['G']}+ allowed{C['N']}  "
                          f"{' '.join(sorted(fresh))}  {C['D']}another process authorized this{C['N']}")
+                    # Releasing matters as much as exempting. A capture holds the
+                    # interface through usbfs and keeps usbhid detached, so a device
+                    # allowed while being captured stayed dead: admitted on paper,
+                    # still unusable. SKIP alone only helped if you unplugged it.
+                    for vp_ in sorted(fresh):
+                        for ck in _drop_capture(capturing, vp_, release=True):
+                            emit(f"  {time.strftime('%H:%M:%S')}  {C['G']}  released{C['N']}  "
+                                 f"{ck}  {C['D']}capture stopped, drivers rebinding{C['N']}")
                     status(f"allow list now {len(allow)} device(s)")
             now = usbinfo.snapshot()
+
+            # Reconcile, do not sequence. An allowed device must end up authorized, and
+            # there were two ways it did not:
+            #   - releasing a capture calls prepare()'s restore(), which puts back the
+            #     values recorded BEFORE the capture authorized anything -- i.e. 0. So
+            #     --authorize granted trust and the release immediately revoked it.
+            #   - SKIP only spares a device from being UNBOUND (protect.py). It says
+            #     nothing about the root-hub gate, so an allowed device that is replugged
+            #     still enumerates unauthorized, and the arrival line said it was left
+            #     alone, which meant nobody authorized it either.
+            # Both are the same mistake: trying to get an ordering right instead of
+            # stating the invariant. Checking it every tick is idempotent and cannot be
+            # raced by a capture thread winding down on its own schedule.
+            reconciled = False
+            for k, m_ in sorted(now.items()):
+                if m_["id"] in allow and m_.get("authorized") == "0":
+                    if protect.authorize(path=m_.get("sysfs")):
+                        reconciled = True
+                        emit(f"  {time.strftime('%H:%M:%S')}  {C['G']}  authorized{C['N']}  "
+                             f"{usbinfo.addr_of(m_.get('sysfs')) or m_['id']}  "
+                             f"{C['D']}on the allow list, drivers binding{C['N']}")
+            if reconciled:
+                # Re-read, or the arrival below renders a device we JUST authorized as
+                # "UNAUTHORIZED authorized=0" while also reporting the driver that only
+                # a successful authorization could have bound. The descriptors are read
+                # live and the snapshot is not, so the two disagreed inside one block.
+                # A security tool that contradicts itself in its own output is worse
+                # than one that says nothing.
+                now = usbinfo.snapshot()
+
+            # Departures BEFORE arrivals. seen is keyed by bus/dev, so a device that
+            # re-enumerates inside one poll interval is a vanished key plus a new one.
+            # Processing arrivals first reported the new devnum before the old one
+            # left, so the output read 'arrived, arrived, removed' for one device that
+            # had simply reset -- and worse, the arrival branch saw its own address
+            # still in `capturing`, skipped starting a capture, and then the departure
+            # branch dropped the entry. Net result: device present, nothing capturing
+            # it, and no future arrival to restart it. Seen on a dock, 2026-08-22.
+            for k in sorted(set(seen) - set(now)):
+                if hide_allowed and seen[k]["id"] in allow:
+                    continue          # hidden on arrival, hidden on departure
+                # Departures existed only as pretty text, so a consumer of --porcelain
+                # watched devices arrive and never leave. Anything tracking live state
+                # from the machine stream drifted permanently after the first unplug.
+                if a.porcelain:
+                    porcelain("removed", addr=usbinfo.addr_of(seen[k].get("sysfs")) or "-",
+                              id=seen[k]["id"],
+                              name=(seen[k]["name"] or "").replace("\t", " "))
+                else:
+                    emit(f"  {time.strftime('%H:%M:%S')}  {C['Y']}- removed{C['N']}  "
+                         f"{seen[k]['id']}  {seen[k]['name']}")
             for k in sorted(set(now) - set(seen)):
                 vp0 = now[k]["id"]
                 if hide_allowed and vp0 in allow:
@@ -578,16 +959,22 @@ def main():
                 if a.porcelain:
                     d = usbinfo.descriptors(vp0)
                     th = usbinfo.threats(d)
-                    porcelain("arrived", id=vp0, name=(now[k]["name"] or "").replace("\t", " "),
+                    _a0 = usbinfo.addr_of(now[k].get("sysfs")) or "-"
+                    porcelain("arrived", addr=_a0, id=vp0,
+                              name=(now[k]["name"] or "").replace("\t", " "),
                               drivers=",".join(d.get("drivers") or []) or "none",
                               worst=usbinfo.rules.worst(set(l for l, _, _ in th)) or "none")
                     for lvl, headline, _ in th:
-                        porcelain("threat", id=vp0, level=lvl, claim=headline)
+                        porcelain("threat", addr=_a0, id=vp0, level=lvl, claim=headline)
                 else:
                     d = show_device(vp0, now[k]["name"], cfg,
                                     first_seen=True, meta=now[k], out=emit)
                 lv = set(l for l, _, _ in usbinfo.threats(d))
-                if "HIGH" in lv: counts["high"] += 1
+                if "HIGH" in lv:
+                    counts["high"] += 1
+                    # Same meaning as --inspect: something scored HIGH this session.
+                    # The signal path calls os._exit, so it has to be recorded now.
+                    protect.set_exit_code(2)
                 elif "MED" in lv: counts["med"] += 1
                 vp = now[k]["id"]
                 # Independent of the branch below, deliberately. This device enumerated
@@ -596,28 +983,34 @@ def main():
                 # on exit will not revive it. Record it now or it stays dead after we
                 # quit. Folding this into the elif chain below would also stop --auto
                 # ever reaching its capture branch.
+                addr0 = usbinfo.addr_of(now[k].get("sysfs"))
                 if gating and now[k].get("authorized") == "0":
                     protect.note_withheld(now[k].get("sysfs"))
                 if vp in allow:
-                    emit(f"                 {C['D']}on the allow list, left alone{C['N']}")
-                elif a.auto and _hid_interfaces(d) and vp not in capturing:
+                    emit(f"                 {C['D']}on the allow list, admitted without recording{C['N']}")
+                elif a.auto and _hid_interfaces(d) and (addr0 or vp) not in capturing:
                     if not protect.is_root():
                         emit(f"                 {C['Y']}--auto needs root, skipping{C['N']}")
                     else:
-                        capturing[vp] = _start_capture(vp, d, capq, stop_all)
-                        emit(f"                 {C['M']}{C['W']}capturing{C['N']}"
-                             f"  {C['D']}reports read directly from the endpoint{C['N']}")
+                        capturing[addr0 or vp] = _start_capture(
+                            vp, d, capq, stop_all, target=addr0)
+                        if a.porcelain:
+                            porcelain("capturing", addr=addr0 or "-", id=vp)
+                        else:
+                            emit(f"                 {C['M']}{C['W']}capturing{C['N']}"
+                                 f"  {C['D']}reports read directly from the endpoint{C['N']}")
                 status(f"last arrival: {vp}  {now[k]['name'][:40]}")
-            for k in sorted(set(seen) - set(now)):
-                if hide_allowed and seen[k]["id"] in allow:
-                    continue          # hidden on arrival, hidden on departure
-                emit(f"  {time.strftime('%H:%M:%S')}  {C['Y']}- removed{C['N']}  "
-                     f"{seen[k]['id']}  {seen[k]['name']}")
             cur_serial = set(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
             for sp in sorted(cur_serial - prev_serial):
-                emit(f"  {time.strftime('%H:%M:%S')}  {C['G']}+ serial{C['N']}   {sp}   {C['D']}./tools/identify {sp}{C['N']}")
+                if a.porcelain:
+                    porcelain("serial", state="appeared", node=sp)
+                else:
+                    emit(f"  {time.strftime('%H:%M:%S')}  {C['G']}+ serial{C['N']}   {sp}   {C['D']}./tools/identify {sp}{C['N']}")
             for sp in sorted(prev_serial - cur_serial):
-                emit(f"  {time.strftime('%H:%M:%S')}  {C['Y']}- serial{C['N']}   {sp}")
+                if a.porcelain:
+                    porcelain("serial", state="gone", node=sp)
+                else:
+                    emit(f"  {time.strftime('%H:%M:%S')}  {C['Y']}- serial{C['N']}   {sp}")
             seen, prev_serial = now, cur_serial
 
             while True:
@@ -626,19 +1019,31 @@ def main():
                 if kind == "keys":
                     typebuf[vp] = typebuf.get(vp, "") + payload
                     lastkey[vp] = time.time()
+                # The capture events were the last prose left in the machine stream.
+                # --observe can never capture anything, so the porcelain test could not
+                # reach this path and did not catch it: a real HID arrival was needed.
                 elif kind == "chord":
-                    emit(f"  {time.strftime('%H:%M:%S')}  {C['R']}{C['W']}CHORD{C['N']}   "
-                         f"{C['D']}{vp}{C['N']}  {payload}")
+                    if a.porcelain: porcelain("chord", id=vp, keys=payload)
+                    else: emit(f"  {time.strftime('%H:%M:%S')}  {C['R']}{C['W']}CHORD{C['N']}   "
+                               f"{C['D']}{vp}{C['N']}  {payload}")
                 elif kind == "note":
-                    col = C['Y'] if str(payload).startswith(("NOTE", "WARNING")) else C['D']
-                    emit(f"  {time.strftime('%H:%M:%S')}  {C['Y']}capture{C['N']} {col}{vp} {payload}{C['N']}")
+                    if a.porcelain:
+                        porcelain("capture_note", id=vp, note=str(payload))
+                    else:
+                        col = C['Y'] if str(payload).startswith(("NOTE", "WARNING")) else C['D']
+                        emit(f"  {time.strftime('%H:%M:%S')}  {C['Y']}capture{C['N']} {col}{vp} {payload}{C['N']}")
                 elif kind == "gone":
-                    emit(f"  {time.strftime('%H:%M:%S')}  {C['D']}capture ended{C['N']} "
-                         f"{C['D']}{vp} {payload if 'before capture' in payload else 'unplugged'}{C['N']}")
-                    capturing.pop(vp, None)
+                    if a.porcelain:
+                        porcelain("capture_end", id=vp, reason=(
+                            "left before capture" if "before capture" in str(payload) else "unplugged"))
+                    else:
+                        emit(f"  {time.strftime('%H:%M:%S')}  {C['D']}capture ended{C['N']} "
+                             f"{C['D']}{vp} {payload if 'before capture' in payload else 'unplugged'}{C['N']}")
+                    _drop_capture(capturing, vp)
                 elif kind == "err":
-                    emit(f"  {time.strftime('%H:%M:%S')}  {C['R']}capture failed{C['N']} {C['D']}{vp} {payload}{C['N']}")
-                    capturing.pop(vp, None)
+                    if a.porcelain: porcelain("capture_error", id=vp, error=str(payload))
+                    else: emit(f"  {time.strftime('%H:%M:%S')}  {C['R']}capture failed{C['N']} {C['D']}{vp} {payload}{C['N']}")
+                    _drop_capture(capturing, vp)
             # flush a device's buffer on a newline, or after it goes quiet
             for vp in list(typebuf):
                 buf = typebuf[vp]
@@ -646,15 +1051,36 @@ def main():
                 if "\n" in buf:
                     *done, rest = buf.split("\n")
                     for line in done:
-                        emit(f"  {time.strftime('%H:%M:%S')}  {C['C']}{C['W']}TYPED{C['N']}   "
-                             f"{C['D']}{vp}{C['N']}  {line}{C['D']}<ENTER>{C['N']}")
+                        if a.porcelain:
+                            porcelain("typed", id=vp, enter=1, text=line)
+                        else:
+                            emit(f"  {time.strftime('%H:%M:%S')}  {C['C']}{C['W']}TYPED{C['N']}   "
+                                 f"{C['D']}{vp}{C['N']}  {line}{C['D']}<ENTER>{C['N']}")
                     typebuf[vp] = rest
                 elif quiet and buf:
-                    emit(f"  {time.strftime('%H:%M:%S')}  {C['C']}{C['W']}TYPED{C['N']}   "
-                         f"{C['D']}{vp}{C['N']}  {buf}")
+                    if a.porcelain:
+                        porcelain("typed", id=vp, enter=0, text=buf)
+                    else:
+                        emit(f"  {time.strftime('%H:%M:%S')}  {C['C']}{C['W']}TYPED{C['N']}   "
+                             f"{C['D']}{vp}{C['N']}  {buf}")
                     typebuf[vp] = ""
             live_txt = "".join(typebuf.values())[-40:]
             status((f"capturing {len(capturing)}" + (f"   >{live_txt}" if live_txt else ""))
                    if capturing else "")
 
-sys.exit(main())
+try:
+    _rc = main()
+except BrokenPipeError:
+    # `--list --porcelain | head` closes the pipe under us. Python turns SIGPIPE into
+    # an exception rather than killing the process, so without this a normal shell
+    # pipeline ends in a traceback. Setting SIGPIPE to SIG_DFL instead would be the
+    # usual fix and is wrong here: the viewer socket writes would then take the signal
+    # and kill the monitor when a viewer detaches.
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except OSError:
+        pass
+    _rc = 0
+except KeyboardInterrupt:
+    _rc = 130
+sys.exit(_rc)

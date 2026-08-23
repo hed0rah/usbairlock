@@ -19,7 +19,7 @@ errors. A read-only filesystem, a stale socket, a viewer that wedges: none of it
 stop the monitor withholding devices, because that is the job and this is a
 convenience. When IPC cannot start, the caller reports it and carries on.
 """
-import errno, fcntl, json, os, socket, time
+import errno, fcntl, json, os, re, socket, time
 
 # Overridable so the lock and socket logic can be tested without root. sudo resets
 # the environment by default, so this is not a path an unprivileged caller steers.
@@ -68,6 +68,22 @@ def read_allow():
             return set(ln.strip() for ln in f if ln.strip() and not ln.startswith("#"))
     except OSError:
         return set()
+
+
+def forget_allow():
+    """Drop the shared allow list. Returns what was in it.
+
+    It lives in /run, which is tmpfs, so it survives every monitor restart until the
+    machine reboots. That persistence is deliberate -- it is what lets --authorize in
+    one terminal reach a monitor in another -- but it means a fresh --paranoid run can
+    silently decline to capture a device you trusted hours ago. This is the way back.
+    """
+    had = read_allow()
+    try:
+        os.unlink(ALLOW)
+    except OSError:
+        pass
+    return had
 
 
 def allow_mtime():
@@ -227,7 +243,63 @@ class Holder(object):
         return len(self.clients)
 
 
-def tee(out, holder):
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class Journal(object):
+    """Append the event stream to a file, as newline-delimited JSON.
+
+    Same events the viewer socket carries, so there is one wire format and a log is
+    replayable by whatever reads a viewer. Colour is stripped: escape codes in a
+    forensic artifact are noise, and they break every line-oriented tool.
+
+    0600, because this records what a device typed. A world-readable copy of captured
+    keystrokes is a worse outcome than not logging at all.
+
+    Flushed per line on purpose. The interesting case is a machine that got yanked or
+    a monitor that was killed, and a buffered last line is exactly the one worth having.
+    """
+
+    def __init__(self, path):
+        self.path, self.fh, self.reason = path, None, None
+        try:
+            # O_NOFOLLOW: the monitor runs as root and --log takes a path from the
+            # command line. A symlink planted at a predictable path -- /tmp/triage.jsonl
+            # is exactly the sort of name someone would use twice -- would otherwise
+            # have root append through it to a file it should not touch.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                         0o600)
+            # fchmod on the descriptor, not chmod on the path. Between the open and a
+            # path-based chmod the name can be swapped, and root would then relax the
+            # permissions of whatever took its place.
+            os.fchmod(fd, 0o600)
+            self.fh = os.fdopen(fd, "a", encoding="utf-8")
+        except OSError as e:
+            self.reason = str(e)
+
+    def write(self, ev, **fields):
+        if self.fh is None:
+            return
+        fields["ev"] = ev
+        fields.setdefault("t", round(time.time(), 3))
+        if "line" in fields:
+            fields["line"] = _ANSI.sub("", str(fields["line"])).rstrip()
+        if "lines" in fields:
+            fields["lines"] = [_ANSI.sub("", str(l)).rstrip() for l in fields["lines"]]
+        try:
+            self.fh.write(json.dumps(fields, default=str) + "\n")
+            self.fh.flush()
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def close(self):
+        if self.fh is not None:
+            try: self.fh.close()
+            except OSError: pass
+            self.fh = None
+
+
+def tee(out, holder, journal=None):
     """Wrap a printer so every line it prints also reaches attached viewers.
 
     The default argument is load-bearing. show_device() calls its out hook with no
@@ -239,6 +311,8 @@ def tee(out, holder):
     def emit(line=""):
         out(line)
         holder.broadcast("log", line=line)
+        if journal is not None:
+            journal.write("log", line=line)
     return emit
 
 

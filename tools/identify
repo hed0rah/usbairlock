@@ -41,15 +41,20 @@ def esptool_bin():
             cands.append(c)
     best, best_v = None, ()
     for c in cands:
-        rc, out = sh(f"{c} version", 20)
+        rc, out = sh([c,"version"], 20)
         m = _re.search(r'v?(\d+)\.(\d+)\.(\d+)', out or "")
         if not m: continue
         v = tuple(int(x) for x in m.groups())
         if v > best_v: best, best_v = c, v
     return best
-def sh(cmd, timeout=25):
+_PORT_RE = re.compile(r"/dev/tty(ACM|USB)\d+")
+
+def sh(argv, timeout=25):
+    """Run an argv LIST. Never a shell. See tools/dump for why this is not cosmetic:
+    the port comes from the command line on a bare /dev/ prefix check, and this tool is
+    pointed at hardware nobody has decided to trust yet."""
     try:
-        r=subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        r=subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
         return r.returncode, (r.stdout or "")+(r.stderr or "")
     except subprocess.TimeoutExpired: return 124, "(timed out)"
     except Exception as e: return 1, str(e)
@@ -70,7 +75,7 @@ def try_esptool(port):
     if not have("esptool"): return None
     # chip-id reads only; it does not touch flash contents
     ex = esptool_bin() or "esptool"
-    rc,out = sh(f"{ex} --port {port} --before default-reset --after hard-reset chip-id", 40)
+    rc,out = sh([ex,"--port",port,"--before","default-reset","--after","hard-reset","chip-id"], 40)
     if rc!=0 and "Chip is" not in out: return None
     d={}
     for pat,key in [(r'Chip is ([^\n(]+)','chip'), (r'Features:\s*([^\n]+)','features'),
@@ -79,7 +84,7 @@ def try_esptool(port):
         m=re.search(pat,out)
         if m: d[key]=m.group(1).strip()
     if not d: return None
-    rc2,out2 = sh(f"{ex} --port {port} flash-id", 40)
+    rc2,out2 = sh([ex,"--port",port,"flash-id"], 40)
     m=re.search(r'Detected flash size:\s*(\S+)', out2)
     if m: d['flash']=m.group(1)
     m=re.search(r'Manufacturer:\s*(\S+)', out2)
@@ -115,7 +120,8 @@ def main():
     if "--tools" in sys.argv:
         report_tools(); return 0
 
-    ports = [a for a in sys.argv[1:] if a.startswith("/dev/")]
+    # a /dev/ prefix is not validation: "/dev/x; rm -rf /; #" passes it
+    ports = [a for a in sys.argv[1:] if _PORT_RE.fullmatch(a) and os.path.exists(a)]
     if not ports:
         ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
 

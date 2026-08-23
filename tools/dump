@@ -14,11 +14,13 @@ images can be large and they are not ours to redistribute.
 
 This tool never writes to a device.
 """
+import shlex
 import glob, hashlib, os, re, shutil, subprocess, sys, time
 
 G="\033[32m"; Y="\033[33m"; R="\033[31m"; D="\033[2m"; B="\033[1m"; N="\033[0m"
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT=os.path.join(ROOT,"dumps")
+_PORT_RE=re.compile(r"/dev/tty(ACM|USB)\d+")
 
 def esptool_bin():
     """Pick the highest-versioned esptool on PATH.
@@ -41,10 +43,26 @@ def esptool_bin():
         if v > best_v: best, best_v = c, v
     return best or "esptool"
 
-def sh(cmd,timeout=600):
-    print(f"{D}    $ {cmd}{N}", flush=True)
-    r=subprocess.run(cmd,shell=True,capture_output=True,text=True,timeout=timeout)
+def sh(argv,timeout=600):
+    """Run an argv LIST. Never a shell.
+
+    This tool exists to be pointed at hardware you have already decided not to trust,
+    and it used shell=True with a command built by f-string. Two values in it came from
+    outside: the port, taken from argv on nothing more than a /dev/ prefix check, and
+    `chip`, which is PARSED OUT OF THE DEVICE'S OWN RESPONSE. A device answering
+    flash-id with a crafted chip name got its text into a shell command run against the
+    machine it was plugged into.
+    """
+    print(f"{D}    $ {' '.join(shlex.quote(a) for a in argv)}{N}", flush=True)
+    r=subprocess.run(argv,shell=False,capture_output=True,text=True,timeout=timeout)
     return r.returncode,(r.stdout or "")+(r.stderr or "")
+
+_SAFE_NAME=re.compile(r"[^A-Za-z0-9._-]+")
+
+def safe_name(s,fallback="unknown"):
+    """A device-supplied string is a filename component, not a command fragment."""
+    out=_SAFE_NAME.sub("_",(s or "").strip())[:40].strip("._-")
+    return out or fallback
 
 def sha(path):
     h=hashlib.sha256()
@@ -72,8 +90,8 @@ def esp(port,size):
         print(f"  {R}esptool not installed{N}"); return 1
     os.makedirs(OUT,exist_ok=True)
     ex=esptool_bin()
-    rc,out=sh(f"{ex} --port {port} flash-id",60)
-    chip=(re.search(r'Chip is ([^\n(]+)',out) or [None,"unknown"])[1].strip().replace(" ","_")
+    rc,out=sh([ex,"--port",port,"flash-id"],60)
+    chip=safe_name((re.search(r'Chip is ([^\n(]+)',out) or [None,"unknown"])[1])
     if not size:
         m=re.search(r'Detected flash size:\s*(\d+)(MB|KB)',out)
         if m:
@@ -84,7 +102,7 @@ def esp(port,size):
             print(f"  {Y}flash size not detected, assuming 4MB. override with --size{N}")
     stamp=time.strftime("%Y%m%d-%H%M%S")
     path=os.path.join(OUT,f"{stamp}_{chip}_{size//1024}k.bin")
-    rc,out=sh(f"{ex} --port {port} read-flash 0 {hex(size)} {path}",900)
+    rc,out=sh([ex,"--port",port,"read-flash","0",hex(size),path],900)
     if rc!=0: print(out[-600:])
     return finish(path)
 
@@ -94,7 +112,7 @@ def rp2040():
     os.makedirs(OUT,exist_ok=True)
     stamp=time.strftime("%Y%m%d-%H%M%S")
     path=os.path.join(OUT,f"{stamp}_rp2040.bin")
-    rc,out=sh(f"picotool save -a {path}",600)
+    rc,out=sh(["picotool","save","-a",path],600)
     if rc!=0: print(out[-600:])
     return finish(path)
 
@@ -104,7 +122,9 @@ def main():
     if "--size" in args:
         size=int(args[args.index("--size")+1],0)
     if "--rp2040" in args: return rp2040()
-    ports=[a for a in args if a.startswith("/dev/")]
+    # startswith("/dev/") is not validation: "/dev/x; rm -rf /; #" passes it. Require
+    # the shape of a real tty node, and it has to exist.
+    ports=[a for a in args if _PORT_RE.fullmatch(a) and os.path.exists(a)]
     if not ports: ports=sorted(glob.glob("/dev/ttyACM*")+glob.glob("/dev/ttyUSB*"))
     if not ports:
         print(f"  {Y}no serial port. run ./usbairlock --inspect first.{N}")

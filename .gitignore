@@ -3,3 +3,4 @@ dumps/
 *.img
 __pycache__/
 *.pyc
+tmp-tests/

@@ -56,6 +56,8 @@ HID_BASE.update({40:"\n", 41:"<ESC>", 42:"<BKSP>", 43:"\t", 44:" ", 45:"-", 46:"
                  78:"<PGDN>", 79:"<RIGHT>", 80:"<LEFT>", 81:"<DOWN>", 82:"<UP>"})
 for _i in range(58, 70): HID_BASE[_i] = "<F%d>" % (_i - 57)
 
+_CHORD_NAMES = {"\n": "ENTER", "\t": "TAB", " ": "SPACE"}
+
 HID_SHIFTED = {}
 for _i, _c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"): HID_SHIFTED[4 + _i] = _c
 for _i, _c in enumerate("!@#$%^&*()"):                 HID_SHIFTED[30 + _i] = _c
@@ -92,10 +94,183 @@ def decode_hid_report(report, previous):
     for k in sorted(fresh):
         ch = (HID_SHIFTED.get(k) if shift else None) or HID_BASE.get(k, "<%d>" % k)
         if others:
-            chords.append("+".join(sorted(others)) + "+" + ch.strip())
+            # ENTER, TAB and space are whitespace in `text`, which is what you want when
+            # reading typed prose. In a chord they vanish: ch.strip() empties them and
+            # ALT+TAB printed as "ALT+". That hid the single most interesting chord a
+            # hostile keyboard sends, so name them rather than stripping them away.
+            chords.append("+".join(sorted(others)) + "+" + (ch.strip() or _CHORD_NAMES.get(ch, "?")))
         else:
             text += ch
     return text, chords, keys
+
+# ---------------------------------------------------------------- report descriptors
+#
+# A HID report descriptor is the device's own declaration of what it can SEND. The class
+# code says "I am a HID"; this says "and these are the kinds of report I will produce".
+# That difference is the whole BadUSB question. A keyboard that also declares consumer
+# control and a vendor-defined channel is not a keyboard with extras, it is a device
+# that has told you it intends to do more than type.
+#
+# Format: a flat stream of items. Each short item is a prefix byte
+#
+#     bTag(4) | bType(2) | bSize(2)
+#
+# followed by 0, 1, 2 or 4 data bytes (bSize 3 means 4). bType: 0 Main, 1 Global,
+# 2 Local. We track the current Usage Page (global) and the pending Usages (local), and
+# every time a Main:Input item appears we record what was declared. That is far short of
+# a full HID parser -- no field layout, no logical ranges -- and it is all the security
+# question needs.
+
+USAGE_PAGES = {
+    0x01: "generic desktop", 0x02: "simulation", 0x03: "vr", 0x04: "sport",
+    0x05: "game", 0x06: "generic device", 0x07: "keyboard", 0x08: "LED",
+    0x09: "button", 0x0A: "ordinal", 0x0B: "telephony", 0x0C: "consumer",
+    0x0D: "digitizer", 0x0F: "PID", 0x10: "unicode", 0x14: "alphanumeric display",
+}
+
+# Generic-desktop usages worth naming, because "generic desktop" alone says nothing.
+DESKTOP_USAGE = {0x01: "pointer", 0x02: "mouse", 0x04: "joystick", 0x05: "gamepad",
+                 0x06: "keyboard", 0x07: "keypad", 0x80: "system control"}
+
+
+def page_name(page):
+    if page is None:
+        return "?"
+    if 0xFF00 <= page <= 0xFFFF:
+        return "vendor-defined 0x%04x" % page
+    return USAGE_PAGES.get(page, "0x%04x" % page)
+
+
+def parse_report_descriptor(data):
+    """What Input reports this descriptor declares.
+
+    Returns {"inputs": [{"page": int, "page_name": str, "usages": [int],
+                         "names": [str], "report_id": int|None}, ...],
+             "pages": sorted set of pages with Input reports,
+             "truncated": bool}
+
+    Never raises on malformed input: a hostile device is exactly the thing that sends a
+    truncated or nonsense descriptor, and refusing to report anything would hand it the
+    outcome it wanted. Anything unparseable ends the walk and sets truncated.
+    """
+    out = {"inputs": [], "pages": [], "collections": [], "truncated": False}
+    if not data:
+        return out
+    b = bytes(data)
+    i, page, usages, report_id = 0, None, [], None
+    n = len(b)
+    while i < n:
+        prefix = b[i]
+        i += 1
+        if prefix == 0xFE:                 # long item: 1 size byte, 1 tag, then data
+            if i + 1 >= n:
+                out["truncated"] = True; break
+            i += 2 + b[i]
+            continue
+        size = prefix & 0x03
+        size = 4 if size == 3 else size
+        if i + size > n:
+            out["truncated"] = True; break
+        val = int.from_bytes(b[i:i + size], "little") if size else 0
+        i += size
+        tag, typ = (prefix >> 4) & 0x0F, (prefix >> 2) & 0x03
+
+        if typ == 1:                       # Global
+            if tag == 0x0:   page = val
+            elif tag == 0x8: report_id = val
+        elif typ == 2:                     # Local
+            if tag == 0x0:                 # Usage
+                usages.append(val)
+            elif tag in (0x1, 0x2):        # Usage Minimum / Maximum
+                usages.append(val)
+        elif typ == 0:                     # Main
+            if tag == 0xA and usages:      # Collection
+                # Per spec the pending Usage describes the collection, and that is
+                # where "this is a mouse" actually lives -- an Input item inside it
+                # carries X/Y, not the word mouse. Record it before it is cleared.
+                out["collections"].append({"page": page, "usage": usages[0]})
+            if tag == 0x8:                 # Input
+                seen = sorted(set(usages))
+                out["inputs"].append({
+                    "page": page,
+                    "page_name": page_name(page),
+                    "usages": seen,
+                    "names": [DESKTOP_USAGE[u] for u in seen
+                              if page == 0x01 and u in DESKTOP_USAGE],
+                    "report_id": report_id,
+                })
+            # Main items clear the local state whatever they were
+            usages = []
+    out["pages"] = sorted({d["page"] for d in out["inputs"] if d["page"] is not None})
+    return out
+
+
+def describe_capability(parsed):
+    """One human line per distinct declared capability."""
+    if not parsed:
+        return []
+    seen, lines = set(), []
+    for c in parsed.get("collections", []):
+        if c["page"] == 0x01 and c["usage"] in DESKTOP_USAGE:
+            nm = DESKTOP_USAGE[c["usage"]]
+            if nm not in seen:
+                seen.add(nm); lines.append(nm)
+    if not parsed.get("inputs"):
+        return lines
+    for d in parsed["inputs"]:
+        label = d["page_name"]
+        if d["names"]:
+            label += " (" + ", ".join(d["names"]) + ")"
+        if label not in seen:
+            seen.add(label)
+            lines.append(label)
+    return lines
+
+
+def capability_threats(parsed):
+    """(level, headline, detail) for what a descriptor DECLARES it can send.
+
+    The class code is a claim about category. This is a claim about capability, and it
+    is the device's own words. A keyboard page plus a consumer page plus a vendor page
+    is not three features, it is a device that can type, press media keys and open an
+    arbitrary channel.
+    """
+    if not parsed:
+        return []
+    out = []
+    if parsed.get("truncated"):
+        # Report this even when nothing else parsed. A device controls its own
+        # descriptor; one that does not decode is a choice, and bailing out early meant
+        # the most suspicious descriptors produced the quietest output.
+        out.append(("MED", "report descriptor is malformed or truncated",
+                    "a device controls its own descriptor, and a broken one is a choice"))
+    if not parsed.get("inputs"):
+        return out
+    pages = set(parsed["pages"])
+    desktop = {u for d in parsed["inputs"] if d["page"] == 0x01 for u in d["usages"]}
+    desktop |= {c["usage"] for c in parsed.get("collections", []) if c["page"] == 0x01}
+
+    types = set()
+    if 0x07 in pages or 0x06 in desktop: types.add("keyboard")
+    if 0x02 in desktop or 0x01 in desktop: types.add("pointer")
+    if 0x0C in pages: types.add("consumer control")
+    vendor = sorted(p for p in pages if 0xFF00 <= p <= 0xFFFF)
+    if vendor: types.add("vendor-defined channel")
+
+    if "keyboard" in types and len(types) > 1:
+        others = sorted(types - {"keyboard"})
+        out.append(("HIGH", "declares keyboard AND " + ", ".join(others),
+                    "its own report descriptor says it can type and " +
+                    ", ".join(others) + ". A keyboard has no reason to."))
+    elif "keyboard" in types:
+        out.append(("HIGH", "report descriptor declares keyboard input",
+                    "not merely a HID class claim: it declares the reports"))
+    if vendor:
+        out.append(("MED", "declares a vendor-defined channel (%s)" %
+                    ", ".join("0x%04x" % p for p in vendor),
+                    "opaque by design; the class code does not describe it"))
+    return out
+
 
 def assess(device):
     """[(level, headline, why)] from a parsed device dict. Pure.
@@ -120,8 +295,28 @@ def assess(device):
             out.append(("MED", "claims a boot-protocol mouse",
                         "pointer injection, and a common cover for a second HID interface"))
         else:
-            out.append(("MED", "claims a raw HID interface",
-                        "no boot protocol, so intent is opaque without its report descriptor"))
+            # If a report descriptor was fetched for this interface, say what the device
+            # DECLARED instead of admitting we did not look. The old line named the
+            # evidence it lacked; capture.report_descriptor() gets it over ep0, on an
+            # interface no driver is allowed to bind.
+            rd = (device.get("report_descriptors") or {}).get(str(i.get("num")))
+            parsed = parse_report_descriptor(rd) if rd else None
+            caps = capability_threats(parsed) if parsed else []
+            if caps:
+                out.extend(caps)
+            elif parsed:
+                # A descriptor was read and nothing in it is alarming. Say WHAT it is
+                # rather than reporting silence: "declares volume and transport keys" is
+                # an answer, "nothing to report" reads like the tool did not look.
+                what = describe_capability(parsed)
+                out.append(("LOW", "report descriptor declares " +
+                            (", ".join(what) if what else "no input reports"),
+                            "read directly from the device; no keyboard and no "
+                            "vendor-defined channel among them"))
+            else:
+                out.append(("MED", "claims a raw HID interface",
+                            "no boot protocol, so intent is opaque without its report "
+                            "descriptor"))
     if to_int(device.get("n_configs"), 1) > 1:
         out.append(("MED", "advertises %s configurations" % device.get("n_configs"),
                     "can present one identity, then switch to another"))

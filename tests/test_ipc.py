@@ -115,6 +115,49 @@ def main():
     h.flush()
     check("dead viewer is dropped, monitor carries on", h.viewers, 0)
 
+    # -- the journal --------------------------------------------------------------
+    # Same wire format as the socket, so a log is replayable by whatever reads a viewer.
+    jpath = os.path.join(TMP, "journal.jsonl")
+    j = ipc.Journal(jpath)
+    check("journal opens", j.reason, None)
+    check("journal is 0600, it records what a device typed",
+          oct(os.stat(jpath).st_mode & 0o777), "0o600")
+
+    j.write("session", argv="--auto")
+    j.write("log", line="\033[32m+ ARRIVED\033[0m  1-1  plain text")
+    j.write("status", lines=["\033[2mheld\033[0m", "second"])
+    j.close()
+
+    import json as _json
+    recs = [_json.loads(l) for l in open(jpath) if l.strip()]
+    check("every event landed", [r["ev"] for r in recs], ["session", "log", "status"])
+    check("colour is stripped from a logged line",
+          recs[1]["line"], "+ ARRIVED  1-1  plain text")
+    check("colour is stripped from status lines too",
+          recs[2]["lines"], ["held", "second"])
+    check("events carry a timestamp", all("t" in r for r in recs), True)
+
+    j2 = ipc.Journal(jpath)
+    j2.write("log", line="after reopen")
+    j2.close()
+    check("reopening appends rather than truncating",
+          len([l for l in open(jpath) if l.strip()]), 4)
+
+    dead = ipc.Journal("/proc/nonexistent/usbairlock.jsonl")
+    check("an unwritable path reports instead of raising", bool(dead.reason), True)
+    dead.write("log", line="swallowed")          # must not raise
+    check("and writing to it is a no-op", dead.fh, None)
+
+    tee_out = []
+    tee_j = ipc.Journal(os.path.join(TMP, "tee.jsonl"))
+    emit2 = ipc.tee(tee_out.append, h, tee_j)
+    emit2("through the tee")
+    emit2()
+    tee_j.close()
+    tee_recs = [_json.loads(l) for l in open(os.path.join(TMP, "tee.jsonl")) if l.strip()]
+    check("tee writes to the journal as well as the terminal",
+          [r.get("line") for r in tee_recs], ["through the tee", ""])
+
     # -- release ----------------------------------------------------------------
     h.close()
     check("socket is gone after close", os.path.exists(ipc.SOCK), False)
@@ -130,6 +173,33 @@ def main():
     bad = ipc.Holder()
     check("unwritable run dir still lets the monitor run", bad.acquire(), True)
     check("and it says why", bool(bad.reason), True)
+
+    # -- forget ------------------------------------------------------------------
+    # The block above deliberately leaves RUNDIR pointing somewhere unwritable, so put
+    # it back before testing anything that expects writes to land.
+    ipc.RUNDIR = TMP
+    ipc.ALLOW = os.path.join(TMP, "allow")
+    ipc.LOCK = os.path.join(TMP, "lock")
+    ipc.SOCK = os.path.join(TMP, "sock")
+
+    # The allow list lives in /run (tmpfs), so it outlives every monitor restart until
+    # the machine reboots. Found on hardware 2026-08-22: a fresh --paranoid --auto
+    # printed "allow list: 1 device(s)" and quietly declined to capture a HIGH keyboard
+    # authorized in an earlier session. Persistence is the feature; no way back was not.
+    ipc.forget_allow()                 # earlier blocks left entries in this file
+    ipc.append_allow(["1a2c:2d23", "090c:1000"])
+    check("the list is there before forgetting",
+          ipc.read_allow(), {"1a2c:2d23", "090c:1000"})
+    check("forget returns what it dropped",
+          ipc.forget_allow(), {"1a2c:2d23", "090c:1000"})
+    check("and the list is empty afterwards", ipc.read_allow(), set())
+    check("forgetting twice is not an error", ipc.forget_allow(), set())
+    check("the file is actually gone, not just empty",
+          os.path.exists(ipc.ALLOW), False)
+    ipc.append_allow(["dead:beef"])
+    check("and a later authorize starts a fresh list",
+          ipc.read_allow(), {"dead:beef"})
+    ipc.forget_allow()
 
     ok = sum(_results)
     print(f"\n  {ok} passed, {len(_results) - ok} failed\n")

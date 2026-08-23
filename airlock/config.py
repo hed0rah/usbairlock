@@ -32,6 +32,11 @@ DEFAULTS = {
         # refuse USB ethernet/RNDIS. A device claiming to be a network adapter can
         # take over DNS and routing on connect.
         "unbind_net": False,
+        # refuse USB serial drivers. A device claiming CDC-ACM gets a tty on plug-in,
+        # and the `option` driver binds cellular modems, which is the same DNS and
+        # routing takeover unbind_net stops, arriving over serial instead of ethernet.
+        # Off by default: it costs you every dev board and USB-serial adapter.
+        "unbind_serial": False,
         # raw USB traffic into the kernel ring buffer. Off even under --paranoid: it is
         # extremely loud and will bury anything else in dmesg.
         "usbfs_snoop": False,
@@ -47,10 +52,31 @@ DEFAULTS = {
     },
 }
 
-SEARCH = [
-    os.path.expanduser("~/.config/usbairlock/config"),
-    "/etc/usbairlock.conf",
-]
+def search_paths():
+    """Where a config is looked for, most specific first.
+
+    Computed per call rather than at import, because it depends on the environment.
+
+    The SUDO_USER entry is not a nicety. The monitor needs root, sudo sets HOME=/root,
+    and the banner tells you to write ~/.config/usbairlock/config -- which unprivileged
+    lands in YOUR home and was then never read by the run that matters. The documented
+    workflow silently did nothing.
+    """
+    paths = [os.path.expanduser("~/.config/usbairlock/config")]
+    who = os.environ.get("SUDO_USER")
+    if who:
+        try:
+            import pwd
+            p_ = os.path.join(pwd.getpwnam(who).pw_dir, ".config/usbairlock/config")
+            if p_ not in paths:
+                paths.append(p_)
+        except Exception:
+            pass
+    paths.append("/etc/usbairlock.conf")
+    return paths
+
+# Back-compat for anything importing the constant. Prefer search_paths().
+SEARCH = search_paths()
 
 def _coerce(v):
     s = str(v).strip()
@@ -66,7 +92,7 @@ def load(explicit=None):
     """defaults <- first config file found (or the explicit one) <- caller's flags"""
     cfg = {k: dict(v) for k, v in DEFAULTS.items()}
     used = None
-    candidates = [explicit] if explicit else SEARCH
+    candidates = [explicit] if explicit else search_paths()
     for path in candidates:
         if path and os.path.isfile(path):
             used = path
