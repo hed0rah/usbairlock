@@ -22,7 +22,7 @@ Two ways to do this, and this module takes the safe one.
 Boot-protocol keyboards send 8-byte reports: byte 0 is the modifier bitmap, byte 1 is
 reserved, bytes 2..7 are up to six simultaneous keycodes (HID usage IDs, not ASCII).
 """
-import ctypes, fcntl, os, struct, time
+import ctypes, errno, fcntl, os, struct, time
 from . import rules
 
 try:
@@ -422,9 +422,23 @@ def capture(vid_pid, interface=0, endpoint=0x81, on_event=None, on_lost=None, se
         try:
             fcntl.ioctl(fd, USBDEVFS_CLAIMINTERFACE, struct.pack("I", interface))
         except OSError as e:
-            raise RuntimeError(
-                f"cannot claim interface {interface}: {e}. "
-                f"ENODEV means the interface is unauthorized, ENOENT means the device is") from e
+            # The three the kernel actually returns here, in the order it checks them.
+            # From usb_driver_claim_interface() in drivers/usb/core/driver.c and
+            # claimintf() in devio.c: the driver check comes BEFORE the authorization
+            # check, so a bound interface reports EBUSY even when it is also
+            # unauthorized. EBUSY is the one a person hits most, and saying only the
+            # other two sent them looking at the gate when a driver had simply got
+            # there first.
+            why = {
+                errno.EBUSY:  "EBUSY: a driver already holds this interface. Detach it, "
+                              "or run the monitor so the gate keeps drivers off",
+                errno.ENODEV: "ENODEV: the interface exists but is not authorized",
+                errno.ENOENT: "ENOENT: no such interface. An unauthorized DEVICE has "
+                              "none at all",
+                errno.EACCES: "EACCES: this usbfs handle has dropped privileges for "
+                              "that interface",
+            }.get(e.errno, str(e))
+            raise RuntimeError(f"cannot claim interface {interface}: {why}") from e
         buf = ctypes.create_string_buffer(8)
         bt = _BulkTransfer(ep=endpoint, len=8, timeout=1000,
                            data=ctypes.cast(buf, ctypes.c_void_p))

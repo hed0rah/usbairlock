@@ -101,6 +101,11 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
             bits.append("self-powered" if pw["self_powered"] else "bus-powered")
             if pw["remote_wakeup"]: bits.append("remote-wakeup")
         if d.get("bcd_device"): bits.append(f"rev={d['bcd_device']}")
+        # Configuration 0 is not "no configuration selected", it is the unconfigured
+        # state, and it is what the kernel forces for an unauthorized device. Saying so
+        # is more useful than leaving the reader to infer it from an empty interface list.
+        if str(d.get("config_value") or "") == "0":
+            bits.append("UNCONFIGURED")
         if bits: p(f"                 {C['D']}{'  '.join(bits)}{C['N']}")
         # Everything below is readable while the gate is shut, before anything binds.
         note = usbinfo.link_note(d.get("usb_version"), d.get("speed"))

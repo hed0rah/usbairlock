@@ -482,6 +482,11 @@ def _enrich(dev, d, spec):
     dev["maxchild"] = _attr(d, "maxchild")
     dev["removable"] = _attr(d, "removable")
     dev["quirks"] = _attr(d, "quirks")
+    # The live configuration. 0 means UNCONFIGURED, which is the precise state a
+    # withheld device is in: usb_set_configuration() forces configuration 0 when
+    # dev->authorized is 0, and an unconfigured device has no interfaces by the USB
+    # spec's own rules. "no interface objects" is the consequence; this is the cause.
+    dev["config_value"] = _attr(d, "bConfigurationValue")
     # Strings are indices in the descriptor blob; the kernel has already resolved them.
     for k, a in (("manufacturer", "manufacturer"), ("product", "product"),
                  ("serial", "serial")):

@@ -32,15 +32,42 @@ def is_root(): return os.geteuid() == 0
 
 # ---------------------------------------------------------------- protections
 
-def withhold_device(on=True):
+# usbcore's device policy, from drivers/usb/core/hcd.c. Writing this attribute sets
+# hcd->dev_policy directly, and usb_dev_authorized() reads it once per device in
+# usb_alloc_dev() -- the constructor. That is why restoring the gate revives nothing:
+# the value was consumed when the device was built.
+POLICY_NONE, POLICY_ALL, POLICY_INTERNAL = 0, 1, 2
+
+def withhold_device(on=True, policy=POLICY_INTERNAL):
     """Device-level gate. A new device enumerates but NO driver binds.
 
     This runs before driver binding, which is the only moment the decision is still
     yours. udev cannot do this: it is userspace and fires after the kernel has already
     matched and bound a driver for many classes.
+
+    Defaults to policy 2, not 0. The kernel offers three:
+
+        0  authorize nothing
+        1  authorize everything (the normal state)
+        2  authorize only devices on ports firmware marked hard-wired
+
+    Policy 2 is the better fit for the actual threat. A hostile device is plugged in; it
+    is not soldered to the board. Under policy 0 an internal webcam or bluetooth module
+    that re-enumerates for any reason -- a bus reset, a suspend and resume -- comes back
+    unauthorized and stays dead, because the kernel copies this once at construction.
+    Making the machine's own hardware collateral buys nothing against a threat that
+    arrives through a socket.
+
+    Pass policy=POLICY_NONE for the blunt version when you genuinely want to trust
+    nothing, including what is already inside the machine.
     """
-    n = sum(_w(os.path.join(r, "authorized_default"), 0 if on else 1) for r in glob.glob(ROOTS))
-    return n, f"device authorization withheld on {n} root hubs"
+    want = policy if on else POLICY_ALL
+    n = sum(_w(os.path.join(r, "authorized_default"), want) for r in glob.glob(ROOTS))
+    if not on:
+        return n, f"device authorization restored on {n} root hubs"
+    how = ("hot-plugged devices only, internal ports still authorize"
+           if want == POLICY_INTERNAL else "every device, including internal")
+    return n, f"device authorization withheld on {n} root hubs: {how}"
 
 def withhold_interface(on=True):
     """Per-INTERFACE gate (kernel 4.13+). Strictly better than the device gate.

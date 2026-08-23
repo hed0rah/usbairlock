@@ -49,6 +49,47 @@ interface the device claims. The keyboard scores `HIGH` on a boot-protocol claim
 last two lines are what it typed, read straight off the endpoint. None of it reached the
 session.
 
+## what the kernel actually does, and why the gate works
+
+Worth stating precisely, because the whole design rests on it and it is checkable in
+`drivers/usb/core/`.
+
+**A device's authorization is decided once, at construction.** `usb_alloc_dev()` ends
+with `dev->authorized = usb_dev_authorized(dev, hcd)`, which reads `hcd->dev_policy` --
+the value the `authorized_default` sysfs attribute writes. Nothing re-evaluates it. That
+is why restoring the gate does not revive a device that arrived while it was shut, and
+why anything holding the gate has to re-authorize what it withheld.
+
+**Descriptors are read before any of that matters.** `usb_new_device()` calls
+`usb_enumerate_device()`, which reads every configuration descriptor and caches the
+product, manufacturer and serial strings, with no authorization check in it at all. The
+device's own account of itself is available whatever you have decided about it.
+
+**Authorization gates configuration, not enumeration.** In `usb_set_configuration()`:
+
+```c
+/* Note that a non-authorized device (dev->authorized == 0) will only
+ * be put in unconfigured mode. */
+if (dev->authorized == 0 || configuration == -1)
+        configuration = 0;
+```
+
+Configuration 0 is the unconfigured state, and an unconfigured device has no interfaces
+by the USB specification's own rules. "An unauthorized device has no interface objects"
+is the consequence; this is the cause. The tool reports it as `UNCONFIGURED`.
+
+**Interfaces inherit their own gate at configuration time**, `intf->authorized =
+!!HCD_INTF_AUTHORIZED(hcd)`, copied once in exactly the same way. And claiming one
+checks, in this order:
+
+```c
+if (dev->driver)        return -EBUSY;   /* a driver got there first */
+if (!iface->authorized) return -ENODEV;  /* the interface gate is shut */
+```
+
+with `ENOENT` from the caller when the interface does not exist at all -- the
+unconfigured case above.
+
 ## what it does that blocking alone does not
 
 A device that claims to be a keyboard can be refused. That tells you it is hostile. It does
@@ -77,7 +118,7 @@ Each is independent, settable in config or by flag (`--unbind-hid`, `--no-withho
 | protection | default | what it does |
 | --- | --- | --- |
 | `withhold_interface` | **on** | device configures normally, but **no interface binds a driver** |
-| `withhold_device` | off | device is held entirely unauthorized. Blunter, see the note |
+| `withhold_device` | off | hot-plugged devices are held unauthorized; ports firmware marks hard-wired still authorize. Kernel policy 2 |
 | `unbind_hid` | off | unbinds and refuses `usbhid`, so a claimed keyboard cannot type |
 | `unbind_storage` | off | refuses `usb-storage` autoprobe |
 | `unbind_net` | off | refuses USB ethernet and RNDIS, which can hijack DNS and routes |
