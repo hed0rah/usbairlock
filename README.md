@@ -123,7 +123,7 @@ Each is independent, settable in config or by flag (`--unbind-hid`, `--no-withho
 | `unbind_storage` | off | refuses `usb-storage` autoprobe |
 | `unbind_net` | off | refuses USB ethernet and RNDIS, which can hijack DNS and routes |
 | `unbind_serial` | off | refuses `cdc_acm`, `ftdi_sio`, `ch341`, `cp210x`, `pl2303`, `option`, so no tty appears for an unknown device |
-| `usbfs_snoop` | off | raw USB traffic into the kernel ring buffer. Very loud |
+| `usbfs_snoop` | off | logs usbfs traffic, meaning userspace access through `/dev/bus/usb`. NOT device-to-driver traffic -- a bound keyboard logs nothing. Useful for seeing what else on the box is driving the bus. Very loud |
 
 **`withhold_interface` is the default because it is better on both counts** (kernel 4.13+).
 Authorization per interface rather than per device means a composite gadget is not

@@ -422,7 +422,7 @@ def capture(vid_pid, interface=0, endpoint=0x81, on_event=None, on_lost=None, se
         try:
             fcntl.ioctl(fd, USBDEVFS_CLAIMINTERFACE, struct.pack("I", interface))
         except OSError as e:
-            # The three the kernel actually returns here, in the order it checks them.
+            # Every code claimintf() in devio.c can return, in the order it checks them.
             # From usb_driver_claim_interface() in drivers/usb/core/driver.c and
             # claimintf() in devio.c: the driver check comes BEFORE the authorization
             # check, so a bound interface reports EBUSY even when it is also
@@ -437,6 +437,15 @@ def capture(vid_pid, interface=0, endpoint=0x81, on_event=None, on_lost=None, se
                               "none at all",
                 errno.EACCES: "EACCES: this usbfs handle has dropped privileges for "
                               "that interface",
+                # claimintf() rejects ifnum >= 8*sizeof(ps->ifclaimed) before it looks
+                # anything up, because the claim set is a bitmask one unsigned long
+                # wide, so the ceiling is platform-dependent. Unreachable for a normal
+                # device and entirely reachable for a hostile descriptor, which is
+                # exactly the case this tool exists for.
+                errno.EINVAL: "EINVAL: interface number is too high for usbfs to "
+                              "track. The claim set is a bitmask one unsigned long wide, "
+                              "so the ceiling is 64 interfaces on a 64-bit box and 32 on "
+                              "a 32-bit one. Such a device cannot be claimed at all",
             }.get(e.errno, str(e))
             raise RuntimeError(f"cannot claim interface {interface}: {why}") from e
         buf = ctypes.create_string_buffer(8)

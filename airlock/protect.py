@@ -185,11 +185,31 @@ def unbind_serial(on=True):
     return total, "; ".join(msgs) or "no USB serial drivers loaded"
 
 def usbfs_snoop(on=True):
-    """usbfs_snoop dumps raw USB traffic to the kernel log. Very loud, very low-level."""
+    """Log USBFS traffic to the kernel ring buffer. Read the scope note before trusting it.
+
+    This does NOT log all USB traffic, which is the obvious reading of the name and is
+    wrong. `usbfs_snoop` is referenced in exactly one file, drivers/usb/core/devio.c, and
+    every call site is on the usbfs path -- traffic a USERSPACE process pushes through
+    /dev/bus/usb/BBB/DDD. Traffic between a device and a kernel driver never touches
+    devio.c, so a keyboard talking to usbhid produces nothing here at all.
+
+    That matters more for this tool than for most. Enabling it, watching a bound keyboard,
+    seeing an empty log and concluding the device is quiet is precisely the "blind tool
+    reports a clean bill of health" failure this program is not allowed to have. For
+    device-to-driver traffic the answer is usbmon, not this.
+
+    What it IS good for: it logs this tool's own capture reads, and anything else on the
+    box driving the bus from userspace -- libusb utilities, another triage tool, a process
+    quietly talking to a device behind your back. As a record of who else is touching USB
+    it is genuinely useful.
+
+    Payloads are truncated at `usbfs_snoop_max`, 65536 bytes by default.
+    """
     p = "/sys/module/usbcore/parameters/usbfs_snoop"
     if not os.path.exists(p): return 0, "usbfs_snoop not available"
     ok = _w(p, "Y" if on else "N")
-    return (1 if ok else 0), ("raw USB traffic logged to the kernel ring buffer"
+    return (1 if ok else 0), ("usbfs traffic logged to the kernel ring buffer "
+                              "(userspace only, not kernel-driver traffic)"
                               if ok else "could not enable usbfs_snoop")
 
 # ---------------------------------------------------------------- lifecycle
@@ -210,7 +230,7 @@ REGISTRY = {
     "unbind_serial":      (unbind_serial,
         "unbinds cdc_acm, ftdi_sio and friends: no tty appears for an unknown device"),
     "usbfs_snoop":        (usbfs_snoop,
-        "usbcore.usbfs_snoop=Y: raw USB traffic into the kernel ring buffer"),
+        "usbcore.usbfs_snoop=Y: logs USERSPACE usbfs traffic only, not driver traffic"),
 }
 
 def release(names=None):
@@ -342,14 +362,31 @@ def install_handlers(on_exit=None):
 def authorize(vid_pid=None, path=None, interfaces=True):
     """Let a specific device, and its interfaces, actually bind.
 
-    Authorising is not enough on its own. The kernel matches drivers at authorisation
-    time, so writing 1 to `authorized` after a device has already enumerated unauthorised
-    leaves it admitted but UNDRIVEN. For most devices that is merely useless. For a hub it
-    is actively confusing: the hub is authorised, no `hub` driver is bound, so its
-    downstream ports stay dead and nothing plugged into it enumerates at all. The operator
-    sees a device they just allowed, plus total silence behind it.
+    Authorising the DEVICE is not enough on its own, and the reason is worth being exact
+    about because the obvious guess is wrong. The kernel does not ignore the write:
+    usb_authorize_device() in hub.c sets authorized=1, then calls usb_choose_configuration()
+    and usb_set_configuration() specifically to "register the interfaces with the driver
+    core and let interface drivers bind to them".
 
-    So after authorising, ask the bus to re-run driver matching for each interface.
+    It fails anyway, because usb_set_configuration() builds each new interface with
+
+        intf->authorized = !!HCD_INTF_AUTHORIZED(hcd)          -- message.c
+
+    and our per-interface gate is still shut, so every one of them is born unauthorized.
+    The driver core then does attempt a bind, and usb_probe_interface() rejects it at
+
+        } else if (intf->authorized == 0) { ... return -ENODEV  -- driver.c
+
+    leaving "Interface N is not authorized for usage" in the kernel log. That line is the
+    fingerprint of this situation if you are ever debugging it from the other end.
+
+    So the device ends up admitted but UNDRIVEN. For most devices that is merely useless.
+    For a hub it is actively confusing: the hub is authorised, no `hub` driver is bound, so
+    its downstream ports stay dead and nothing plugged into it enumerates at all. The
+    operator sees a device they just allowed, plus total silence behind it.
+
+    Authorising the interfaces afterwards fixes their gate but retries nothing, so the
+    match has to be asked for explicitly. Hence trigger_probe() per interface below.
     """
     done = []
     # `path` narrows this to ONE device. Without honouring it, a caller passing only a
