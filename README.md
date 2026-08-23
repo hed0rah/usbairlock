@@ -21,7 +21,7 @@ sudo ./usbairlock --auto -q     # same, trusting and hiding what is already plug
 sudo ./usbairlock --paranoid    # every protection on
 ./usbairlock --status           # what is withheld right now
 ./usbairlock --list             # the device tree, with real addresses
-sudo ./usbairlock --verbose ADDR  # every descriptor of one device, decoded
+sudo ./usbairlock --describe ADDR # every descriptor of one device, decoded
 ```
 
 Run it in a spare terminal and plug something in. Arrivals print with their descriptors,
@@ -319,10 +319,10 @@ version is doing so on purpose -- a Bluetooth adapter declaring USB 2.01 and run
 12 Mb/s has no use for High Speed. Flagging that would bury the one case that means
 something.
 
-## --verbose: every byte, decoded
+## --describe: every byte, decoded
 
 ```sh
-sudo ./usbairlock --verbose 1-5
+sudo ./usbairlock --describe 1-5
 ```
 
 ```
@@ -758,7 +758,7 @@ tables. Everything Linux-specific lives elsewhere.
 | `./usbairlock --replay FILE` | render a log back. Exit 2 if anything in it scored HIGH |
 | `./usbairlock --inspect [ADDR]` | one-shot: what is attached and what it claims |
 | `./usbairlock --diagnose` | nothing appeared. Why not |
-| `sudo ./usbairlock --verbose ADDR` | every descriptor of one device, decoded, with a byte count |
+| `sudo ./usbairlock --describe ADDR` | every descriptor of one device, decoded, with a byte count |
 | `sudo ./usbairlock --hid ADDR` | dump the HID report descriptors: what the device declares it can send |
 | `sudo ./usbairlock --arm` / `--disarm` | apply or release protections and exit, persistently |
 | `sudo ./usbairlock --authorize VID:PID` | admit one device, and share that decision with a running monitor |
@@ -853,9 +853,9 @@ not cover.
                  viewer channel in ipc.py
     airlock-min  the whole idea in one file, for a box with nothing installed
     tools/       identify and dump: the post-airlock hardware step
-    tests/       12 files: threats, ipc, restore, topology, replay, release, rebind,
-                 porcelain, injection, device text, HID and raw descriptors
-    notes/       the threat model
+    tests/       13 files: threats, ipc, restore, topology, replay, release, rebind,
+                 porcelain, injection, device text, HID and raw descriptors, CLI surface
+    notes/       the threat model, and every kernel claim checked against the source
     docs/        the screenshot
     dumps/       firmware read out of boards, gitignored. They get large, and they are
                  not ours to redistribute

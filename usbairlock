@@ -8,7 +8,7 @@
     sudo ./usbairlock --paranoid --auto  every protection on, plus recording
     ./usbairlock --status                what is protected right now, then exit
     ./usbairlock --diagnose              nothing appeared, why not
-    sudo ./usbairlock --verbose ADDR     every descriptor, decoded, with a byte count
+    sudo ./usbairlock --describe ADDR    every descriptor, decoded, with a byte count
     sudo ./usbairlock --hid ADDR         what a HID device declares it can send
     ./usbairlock --write-config          print a config file to stdout
 
@@ -23,6 +23,8 @@ Every protection is reversible and is restored when this exits, including on Ctr
 or a kill.
 """
 import argparse, glob, json, os, queue, re, signal, sys, threading, time
+
+VERSION = "0.9.0"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from airlock import config as cfgmod, protect, usbinfo, capture as capmod, live as livemod
@@ -393,7 +395,7 @@ def _start_capture(vp, d, q, stop, target=None):
     t.start()
     return t, mine, vp
 
-def do_verbose(spec):
+def do_describe(spec):
     """Everything in a device's descriptors, decoded, with every byte accounted for.
 
     The bar here is `lsusb -v`, which prints the same bytes. What this adds:
@@ -861,8 +863,14 @@ def main():
                     help="every device with its low-level addresses, then exit")
     ap.add_argument("--attach", action="store_true",
                     help="watch a monitor that is already running, read-only")
-    ap.add_argument("--verbose", "-v", metavar="ADDR",
+    # --describe, not --verbose. This takes a device and prints a report; it is a mode
+    # like --inspect and --hid, not a verbosity level. Named --verbose it both read as a
+    # modifier ("--list --verbose") and held -v hostage from --version, and the author of
+    # the flag still tripped over it. The old spelling keeps working.
+    ap.add_argument("--describe", "--verbose", dest="describe", metavar="ADDR",
                     help="every descriptor of one device, decoded, then exit")
+    ap.add_argument("--version", "-V", action="store_true",
+                    help="print the version, then exit")
     ap.add_argument("--hid", metavar="ADDR",
                     help="dump the HID report descriptors of one device, then exit")
     ap.add_argument("--forget", action="store_true",
@@ -876,6 +884,7 @@ def main():
         ap.add_argument(f"--no-{flag}", dest=name, action="store_false")
     a = ap.parse_args()
 
+    if a.version: p(f"usbairlock {VERSION}"); return 0
     if a.help: p(__doc__); return 0
     if a.write_config: print(cfgmod.sample()); return 0
 
@@ -916,7 +925,7 @@ def main():
               + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
               + f"{C['N']}")
         return 0 if done else 1
-    if a.verbose: return do_verbose(a.verbose)
+    if a.describe: return do_describe(a.describe)
     if a.hid: return do_hid(a.hid, a.porcelain)
     if a.forget: return do_forget(a.porcelain)
     if a.replay: return do_replay(a, a.replay)
