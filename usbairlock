@@ -9,6 +9,7 @@
     ./usbairlock --status                what is protected right now, then exit
     ./usbairlock --diagnose              nothing appeared, why not
     ./usbairlock --list                  every device and its addresses
+    ./usbairlock --list -q               ...without the hint. -qq for bare rows, to pipe
     ./usbairlock --write-config          print a config file to stdout
 
 How deep to look at ONE device, shallowest first. Each takes an address from --list:
@@ -805,9 +806,10 @@ def do_list(a):
         for r in rows:
             porcelain("dev", **r)
         return 0
-    p()
-    p(f"  {C['D']}addr           bus/dev   id           ifcls   driver      auth  name{C['N']}")
-    rule()
+    if a.quiet < 2:
+        p()
+        p(f"  {C['D']}addr           bus/dev   id           ifcls   driver      auth  name{C['N']}")
+        rule()
     for r in rows:
         auth = f"{C['G']}1{C['N']}" if r["auth"] == "1" else f"{C['R']}0{C['N']}"
         tag = f"{C['B']}[HUB]{C['N']} " if r["hub"] == "1" else ""
@@ -822,15 +824,12 @@ def do_list(a):
         if r["stranded"] != "-":
             p(f"  {' ' * 14} {C['R']}unreachable{C['N']} {C['D']}behind unauthorized hub "
               f"{r['stranded']}, nothing below it can enumerate{C['N']}")
-    p()
-    p(f"  {C['D']}{len(rows)} device(s). address any of them by addr, bus/dev, node or id:{C['N']}")
+    if a.quiet >= 1:
+        return 0
     example = next((r["addr"] for r in rows if r["hub"] == "0"), rows[0]["addr"] if rows else "1-1")
-    p(f"  {C['D']}  sudo ./usbairlock --inspect  {example}   {C['N']}"
-      f"{C['D']}what it is and whether to worry{C['N']}")
-    p(f"  {C['D']}  sudo ./usbairlock --describe {example}   {C['N']}"
-      f"{C['D']}every descriptor byte, decoded  <- the deepest view{C['N']}")
-    p(f"  {C['D']}  sudo ./usbairlock --hid      {example}   {C['N']}"
-      f"{C['D']}what a HID device declares it can send{C['N']}")
+    p()
+    p(f"  {C['D']}{len(rows)} device(s). look closer, shallowest first:{C['N']}  "
+      f"{C['D']}sudo ./usbairlock --{{inspect,hid,describe}} {example}{C['N']}")
     return 0
 
 
@@ -862,8 +861,12 @@ def main():
     # DISPLAY: what is shown. Deliberately independent of policy.
     ap.add_argument("--hide-allowed", "-H", action="store_true",
                     help="do not print devices that are on the allow list")
-    ap.add_argument("--quiet", "-q", action="store_true",
-                    help="both of the above: allow what is attached, and hide it")
+    # A level, not a switch. Existing `if a.quiet` tests still work: count is 0 when the
+    # flag is absent. -q drops the hints, -qq drops the furniture too, so `--list -qq`
+    # pipes into cut and awk without anything to strip first.
+    ap.add_argument("--quiet", "-q", action="count", default=0,
+                    help="less output. In the monitor: allow what is attached and hide it. "
+                         "With --list: -q drops the hint line, -qq drops the header too")
     ap.add_argument("--auto", action="store_true",
                     help="act on arrivals: record what a HID device types (needs root)")
     ap.add_argument("--plain", action="store_true",
@@ -1026,7 +1029,7 @@ def main():
     allow |= set(str(cfg.get("allow", {}).get("devices", "")).replace(",", " ").split())
     if a.allow_existing or a.quiet:
         allow |= set(m["id"] for m in seen.values())
-    hide_allowed = a.hide_allowed or a.quiet
+    hide_allowed = bool(a.hide_allowed or a.quiet)   # quiet is a count now, not a flag
     # The shared allow list lives in /run and is re-read every tick, so an --authorize
     # run in another terminal lands here without restarting the monitor. SIGUSR1 only
     # makes that happen immediately instead of within one poll interval.

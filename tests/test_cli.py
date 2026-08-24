@@ -54,6 +54,23 @@ def main():
     check("-v is rejected, not misread as a mode", "unrecognized arguments: -v" in out, True)
     check("and that is an error exit", rc != 0, True)
 
+    # -- the quiet ladder ----------------------------------------------------------
+    # --list printed three unsolicited hint lines on every run, which is noise for anyone
+    # who already knows the tool. -q drops the hint, -qq drops the furniture so the output
+    # pipes into cut and awk with nothing to strip.
+    _, plain = run("--list")
+    _, q1 = run("--list", "-q")
+    _, q2 = run("--list", "-qq")
+    check("the hint is one line, not three", plain.count("./usbairlock --{"), 1)
+    check("-q drops the hint entirely", "look closer" in q1, False)
+    check("-qq drops the column header too", "bus/dev" in q2, False)
+    check("but -qq still prints the devices",
+          len([l for l in q2.splitlines() if l.strip()]) > 0, True)
+    check("each level is strictly shorter than the last",
+          len(plain) > len(q1) > len(q2), True)
+    # -q must not become an error the way -v did
+    check("-q is accepted, not rejected", "unrecognized" in q1, False)
+
     # -- help still works and is not the argparse default ---------------------------
     rc, out = run("--help")
     check("--help exits 0", rc, 0)
