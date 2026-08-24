@@ -344,6 +344,21 @@ def addr_of(d):
     return os.path.basename((d or "").rstrip("/")) or None
 
 
+def is_internal(removable, addr=None):
+    """Is this on a port the machine's own firmware marks hard-wired.
+
+    Only trustworthy directly off a ROOT hub, where ACPI describes the ports. Behind an
+    external hub the bit comes from that hub's own descriptor and is its claim, not the
+    machine's -- see attachment(). So a device behind a hub is never called internal here
+    however loudly the hub insists, which also means a hostile hub cannot use this to hide
+    what is plugged into it.
+    """
+    if (removable or "").strip().lower() != "fixed":
+        return False
+    parent = parent_of(addr) if addr else None
+    return bool(parent) and str(parent).startswith("usb")
+
+
 def id_of(d):
     """vid:pid for a sysfs device dir, or None.
 

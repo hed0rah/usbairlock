@@ -82,6 +82,19 @@ def main():
     rc, out = run("--interrogate")
     check("--interrogate requires an address", rc != 0, True)
 
+    # -- -x, and the reworked quiet ladder --------------------------------------------
+    _, plain = run("--list")
+    _, ext   = run("--list", "-x")
+    check("-x is accepted", "unrecognized" in ext, False)
+    check("-x says how many it hid rather than silently shrinking",
+          ("--external-only" in ext) or ("device(s)" in ext), True)
+    check("--external-only is the long form",
+          "unrecognized" in run("--list", "--external-only")[1], False)
+    check("--ignore-existing replaced --allow-existing",
+          "unrecognized" in run("--list", "--ignore-existing")[1], False)
+    check("and the old spelling still works, it shipped",
+          "unrecognized" in run("--list", "--allow-existing")[1], False)
+
     # -- help still works and is not the argparse default ---------------------------
     rc, out = run("--help")
     check("--help exits 0", rc, 0)

@@ -2,7 +2,9 @@
 """usbairlock -- it shows you things... horrible things
 
     sudo ./usbairlock --auto             the usual run: withhold arrivals, record what types
-    sudo ./usbairlock --auto -q          same, but trust and hide what is already plugged in
+    sudo ./usbairlock --auto -q          same, with alternate settings folded away
+    sudo ./usbairlock --auto -qq         same, and ignore whatever is already attached
+    sudo ./usbairlock --auto -x          same, but only devices somebody plugged in
     sudo ./usbairlock                    withhold and watch, no recording
     ./usbairlock --observe               watch only, change nothing, no root needed
     sudo ./usbairlock --paranoid --auto  every protection on, plus recording
@@ -10,6 +12,7 @@
     ./usbairlock --diagnose              nothing appeared, why not
     ./usbairlock --list                  every device and its addresses
     ./usbairlock --list -q               ...without the hint. -qq for bare rows, to pipe
+    ./usbairlock --list -x               ...only what somebody plugged in
     ./usbairlock --write-config          print a config file to stdout
 
 How deep to look at ONE device, shallowest first. Every DEVICE accepts any of the four
@@ -86,7 +89,7 @@ def banner(cfg, results, cfg_path, observe):
         p(f"    {col}{mark}{C['N']} {namecol} {col}{wordcol}{C['N']} {C['D']}{detail}{C['N']}")
     rule()
 
-def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
+def show_device(vp, name, cfg, first_seen=False, meta=None, out=None, quiet=0):
     # `out` routes these lines through the pinned-status logger, so the status block gets
     # repainted after each line instead of being scrolled off the screen.
     p = out or _p
@@ -144,7 +147,11 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
             p(f"                 {C['G']}UNBOUND{C['N']}  {C['D']}interfaces present, no driver attached{C['N']}")
         else:
             p(f"                 {C['G']}no drivers bound{C['N']}")
-        for i in d.get("interfaces", []):
+        ifs = d.get("interfaces", [])
+        alts = [i for i in ifs if str(i.get("alt", "0")) != "0"]
+        if quiet >= 1 and alts:
+            ifs = [i for i in ifs if str(i.get("alt", "0")) == "0"]
+        for i in ifs:
             c = usbinfo._i(i.get("cls"))
             nm = usbinfo.CLASSES.get(c, "?")
             extra = f"  {C['D']}{i['name']}{C['N']}" if mode == "full" and i.get("name") else ""
@@ -157,6 +164,11 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
             alt = f" alt{i['alt']}" if str(i.get("alt", "0")) != "0" else ""
             p(f"                 {C['C']}if{i.get('num')}{alt}{C['N']} class 0x{c:02x} {nm:16s}"
               f" sub={i.get('sub')} proto={i.get('proto')}{eps}{extra}")
+        if quiet >= 1 and alts:
+            # Say what was dropped. A listing that silently omits things is how a tool
+            # ends up describing a device as simpler than it is.
+            p(f"                 {C['D']}+ {len(alts)} alternate setting(s) hidden, "
+              f"drop -q to show them{C['N']}")
 
     th = usbinfo.threats(d)
     if th:
@@ -283,7 +295,7 @@ def do_inspect(cfg, target=None, porc=False):
                 porcelain("threat", addr=usbinfo.addr_of(m.get("sysfs")),
                           id=m["id"], level=lvl, claim=headline)
         else:
-            d = show_device(m["id"], m["name"], cfg, meta=m)
+            d = show_device(m["id"], m["name"], cfg, meta=m, quiet=a.quiet)
             th = usbinfo.threats(d)
         for lvl, _, _ in th:
             worst = max(worst, {"LOW":1,"MED":2,"HIGH":3}[lvl])
@@ -961,6 +973,7 @@ def do_list(a):
             "driver": ",".join(sorted(set(drivers))) or "none",
             "auth": usbinfo._attr(d, "authorized") or "?",
             "hub": "1" if usbinfo._attr(d, "bDeviceClass") == "09" else "0",
+            "removable": usbinfo._attr(d, "removable") or "",
             "parent": usbinfo.parent_of(usbinfo.addr_of(d)) or "-",
             "depth": str(usbinfo.depth_of(usbinfo.addr_of(d))),
             "name": (name or "-").replace("\t", " "),
@@ -969,6 +982,13 @@ def do_list(a):
     # A device behind an unauthorized hub is enumerated and unreachable, and nothing
     # says so anywhere. Walk up the tree once and mark them, because "allowed it and
     # nothing happened" is the confusing case this listing exists to explain.
+    if getattr(a, "external_only", False):
+        kept = [r for r in rows
+                if not usbinfo.is_internal(r.get("removable"), r.get("addr"))]
+        dropped = len(rows) - len(kept)
+        rows = kept
+    else:
+        dropped = 0
     auth_by = {r["addr"]: r["auth"] for r in rows}
     for r in rows:
         r["stranded"] = usbinfo.stranded_by(r["addr"], auth_by) or "-"
@@ -1014,6 +1034,8 @@ def do_list(a):
         return 0
     example = next((r["addr"] for r in rows if r["hub"] == "0"), rows[0]["addr"] if rows else "1-1")
     p()
+    if dropped:
+        p(f"  {C['D']}{dropped} internal device(s) hidden by --external-only{C['N']}")
     p(f"  {C['D']}{len(rows)} device(s). look closer, shallowest first:{C['N']}  "
       f"{C['D']}sudo ./usbairlock --{{inspect,hid,describe}} {example}{C['N']}")
     return 0
@@ -1040,8 +1062,10 @@ def main():
     ap.add_argument("--endpoint", type=lambda x: int(x,0), default=0x81)
     ap.add_argument("--interval", type=float)
     # POLICY: what is trusted.
-    ap.add_argument("--allow-existing", "-A", action="store_true",
-                    help="add everything currently attached to the allow list")
+    ap.add_argument("--ignore-existing", "--allow-existing", "-A",
+                    dest="allow_existing", action="store_true",
+                    help="ignore whatever is already attached: trust it and stop "
+                         "reporting it. Only arrivals after this point are judged")
     ap.add_argument("--allow", dest="allow_list", action="append", metavar="VID:PID",
                     default=[], help="allow one device, repeatable")
     # DISPLAY: what is shown. Deliberately independent of policy.
@@ -1077,6 +1101,13 @@ def main():
                     help="print the version, then exit")
     ap.add_argument("--hid", metavar="DEVICE",
                     help="dump the HID report descriptors of one device, then exit")
+    # Internal devices are ordinary USB devices in every respect -- same bus, same
+    # drivers -- and differ only in sitting on a port firmware marks hard-wired. That one
+    # bit is exactly the triage question: did somebody attach this, or did it ship inside
+    # the machine. Filtering on it is not cosmetic, it is the whole question narrowed.
+    ap.add_argument("--external-only", "-x", action="store_true",
+                    help="hide devices on ports firmware marks hard-wired: the webcam, "
+                         "the bluetooth module, anything soldered in")
     ap.add_argument("--interrogate", metavar="DEVICE",
                     help="question a held device over endpoint 0: every string, the "
                          "descriptors nothing else asks for, and where its claims "
@@ -1190,7 +1221,7 @@ def main():
 
     # Tell the protection layer what to leave alone before it unbinds anything.
     _snap0 = usbinfo.snapshot()
-    protect.SKIP = set(_snap0[k]["id"] for k in _snap0) if (a.allow_existing or a.quiet) \
+    protect.SKIP = set(_snap0[k]["id"] for k in _snap0) if (a.allow_existing or a.quiet >= 2) \
                    else set(a.allow_list)
     results = protect.apply(cfg["protections"]) if not a.observe else \
               [(n, False, None, d) for n,(f,d) in protect.REGISTRY.items()]
@@ -1229,9 +1260,9 @@ def main():
     # nothing ever trusted it. Collapsing the two made the tool lie about which applied.
     allow = set(a.allow_list)
     allow |= set(str(cfg.get("allow", {}).get("devices", "")).replace(",", " ").split())
-    if a.allow_existing or a.quiet:
+    if a.allow_existing or a.quiet >= 2:
         allow |= set(m["id"] for m in seen.values())
-    hide_allowed = bool(a.hide_allowed or a.quiet)   # quiet is a count now, not a flag
+    hide_allowed = bool(a.hide_allowed or a.quiet >= 2)
     # The shared allow list lives in /run and is re-read every tick, so an --authorize
     # run in another terminal lands here without restarting the monitor. SIGUSR1 only
     # makes that happen immediately instead of within one poll interval.
@@ -1252,6 +1283,10 @@ def main():
                           drivers=",".join(d0.get("drivers") or []) or "none",
                           worst=usbinfo.rules.worst(
                               set(l for l, _, _ in usbinfo.threats(d0))) or "none")
+        if a.external_only and usbinfo.is_internal(
+                usbinfo._attr(m.get("sysfs") or "", "removable"),
+                usbinfo.addr_of(m.get("sysfs"))):
+            continue
         if hide_allowed and m["id"] in allow:
             continue
         if a.porcelain:
@@ -1267,7 +1302,7 @@ def main():
                       drivers=",".join(d0.get("drivers") or []) or "none",
                       worst=usbinfo.rules.worst(set(l for l, _, _ in th)) or "none")
         else:
-            show_device(m["id"], m["name"], cfg, meta=m)
+            show_device(m["id"], m["name"], cfg, meta=m, quiet=a.quiet)
         shown += 1
     if allow:
         hid = len(seen) - shown
@@ -1415,7 +1450,7 @@ def main():
                     for lvl, headline, _ in th:
                         porcelain("threat", addr=_a0, id=vp0, level=lvl, claim=headline)
                 else:
-                    d = show_device(vp0, now[k]["name"], cfg,
+                    d = show_device(vp0, now[k]["name"], cfg, quiet=a.quiet,
                                     first_seen=True, meta=now[k], out=emit)
                 lv = set(l for l, _, _ in usbinfo.threats(d))
                 if "HIGH" in lv:
