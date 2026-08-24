@@ -8,9 +8,16 @@
     sudo ./usbairlock --paranoid --auto  every protection on, plus recording
     ./usbairlock --status                what is protected right now, then exit
     ./usbairlock --diagnose              nothing appeared, why not
-    sudo ./usbairlock --describe ADDR    every descriptor, decoded, with a byte count
-    sudo ./usbairlock --hid ADDR         what a HID device declares it can send
+    ./usbairlock --list                  every device and its addresses
     ./usbairlock --write-config          print a config file to stdout
+
+How deep to look at ONE device, shallowest first. Each takes an address from --list:
+
+    sudo ./usbairlock --inspect ADDR     what it is, and whether to worry about it
+    sudo ./usbairlock --hid ADDR         what a HID device declares it can send
+    sudo ./usbairlock --describe ADDR    EVERY descriptor byte, decoded, with a receipt
+                                         proving none were skipped. The deepest view
+                                         there is, and more than `lsusb -v` prints
 
 One monitor runs at a time. A second one is refused rather than allowed to fight it over
 the same kernel settings. From any other terminal:
@@ -818,7 +825,12 @@ def do_list(a):
     p()
     p(f"  {C['D']}{len(rows)} device(s). address any of them by addr, bus/dev, node or id:{C['N']}")
     example = next((r["addr"] for r in rows if r["hub"] == "0"), rows[0]["addr"] if rows else "1-1")
-    p(f"  {C['D']}  sudo ./usbairlock --inspect {example}{C['N']}")
+    p(f"  {C['D']}  sudo ./usbairlock --inspect  {example}   {C['N']}"
+      f"{C['D']}what it is and whether to worry{C['N']}")
+    p(f"  {C['D']}  sudo ./usbairlock --describe {example}   {C['N']}"
+      f"{C['D']}every descriptor byte, decoded  <- the deepest view{C['N']}")
+    p(f"  {C['D']}  sudo ./usbairlock --hid      {example}   {C['N']}"
+      f"{C['D']}what a HID device declares it can send{C['N']}")
     return 0
 
 
@@ -829,7 +841,10 @@ def main():
     ap.add_argument("--write-config", action="store_true")
     ap.add_argument("--authorize", metavar="VID:PID",
                     help="write authorized=1 for one device, then exit")
-    ap.add_argument("--descriptors", choices=["none","summary","full"])
+    ap.add_argument("--descriptors", choices=["none","summary","full"],
+                    help="how much descriptor detail the monitor and --inspect print "
+                         "(default summary). This is a level for those views; to deep-dive "
+                         "one device use --describe instead")
     ap.add_argument("--arm", action="store_true", help="apply protections and exit, they persist")
     ap.add_argument("--disarm", action="store_true", help="release every protection and exit")
     ap.add_argument("--diagnose", action="store_true", help="why did nothing appear")
