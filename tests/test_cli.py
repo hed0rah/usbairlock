@@ -86,7 +86,13 @@ def main():
     rc, out = run("--help")
     check("--help exits 0", rc, 0)
     check("and shows the hand-written usage", "it shows you things" in out, True)
-    check("which documents the renamed flag", "--describe ADDR" in out, True)
+    check("which documents the renamed flag", "--describe DEVICE" in out, True)
+    # Every device-taking flag goes through the same resolve(), so every one of them must
+    # advertise the same thing. They used to split three-and-three between VID:PID and
+    # ADDR while all six accepted both, so half the help was wrong in each direction.
+    for flag in ("inspect", "hid", "describe", "interrogate", "authorize", "capture"):
+        check(f"--{flag} advertises DEVICE, not one specific form",
+              f"--{flag} DEVICE" in out or f"--{flag} " not in out, True)
 
     ok = sum(_results)
     print(f"\n  {ok} passed, {len(_results) - ok} failed\n")

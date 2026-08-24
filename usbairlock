@@ -12,23 +12,26 @@
     ./usbairlock --list -q               ...without the hint. -qq for bare rows, to pipe
     ./usbairlock --write-config          print a config file to stdout
 
-How deep to look at ONE device, shallowest first. Each takes an address from --list:
+How deep to look at ONE device, shallowest first. Every DEVICE accepts any of the four
+forms --list prints: an address (1-4.2), a vid:pid (0bda:8153), a bus/dev pair (001/023),
+or a /dev/bus/usb node. A vid:pid names a MODEL and may match more than one.
 
-    sudo ./usbairlock --inspect ADDR     what it is, and whether to worry about it
-    sudo ./usbairlock --hid ADDR         what a HID device declares it can send
-    sudo ./usbairlock --describe ADDR    EVERY descriptor byte, decoded, with a receipt
-                                         proving none were skipped. The deepest view
-                                         there is, and more than `lsusb -v` prints
-    sudo ./usbairlock --interrogate ADDR ASK it things, over endpoint 0, while the gate
-                                         is still shut: every string index, the
-                                         descriptors nothing else requests, and where
-                                         its claims disagree with its live state
+    sudo ./usbairlock --inspect DEVICE      what it is, and whether to worry about it
+    sudo ./usbairlock --hid DEVICE          what a HID device declares it can send
+    sudo ./usbairlock --describe DEVICE     every descriptor byte, decoded, with a
+                                            receipt proving none were skipped. More
+                                            than `lsusb -v` prints
+    sudo ./usbairlock --interrogate DEVICE  ask it things over endpoint 0 while the
+                                            gate is still shut: every string index,
+                                            the descriptors nothing else requests,
+                                            and where its claims disagree with its
+                                            live state
 
 One monitor runs at a time. A second one is refused rather than allowed to fight it over
 the same kernel settings. From any other terminal:
 
     sudo ./usbairlock --attach           watch the running monitor, read-only
-    sudo ./usbairlock --authorize VID:PID  admit a device, and tell the monitor to trust it
+    sudo ./usbairlock --authorize DEVICE  admit a device, and tell the monitor to trust it
     sudo ./usbairlock --forget           clear the allow list (it persists in /run)
 
 Every protection is reversible and is restored when this exits, including on Ctrl-C
@@ -1021,7 +1024,7 @@ def main():
     ap.add_argument("--config"); ap.add_argument("--observe", action="store_true")
     ap.add_argument("--paranoid", action="store_true"); ap.add_argument("--status", action="store_true")
     ap.add_argument("--write-config", action="store_true")
-    ap.add_argument("--authorize", metavar="VID:PID",
+    ap.add_argument("--authorize", metavar="DEVICE",
                     help="write authorized=1 for one device, then exit")
     ap.add_argument("--descriptors", choices=["none","summary","full"],
                     help="how much descriptor detail the monitor and --inspect print "
@@ -1030,8 +1033,8 @@ def main():
     ap.add_argument("--arm", action="store_true", help="apply protections and exit, they persist")
     ap.add_argument("--disarm", action="store_true", help="release every protection and exit")
     ap.add_argument("--diagnose", action="store_true", help="why did nothing appear")
-    ap.add_argument("--inspect", nargs="?", const=True, metavar="VID:PID")
-    ap.add_argument("--capture", metavar="VID:PID",
+    ap.add_argument("--inspect", nargs="?", const=True, metavar="DEVICE")
+    ap.add_argument("--capture", metavar="DEVICE",
                     help="read what a HID device types WITHOUT letting it reach the system")
     ap.add_argument("--iface", type=int, default=0)
     ap.add_argument("--endpoint", type=lambda x: int(x,0), default=0x81)
@@ -1068,13 +1071,13 @@ def main():
     # like --inspect and --hid, not a verbosity level. Named --verbose it both read as a
     # modifier ("--list --verbose") and held -v hostage from --version, and the author of
     # the flag still tripped over it. The old spelling keeps working.
-    ap.add_argument("--describe", "--verbose", dest="describe", metavar="ADDR",
+    ap.add_argument("--describe", "--verbose", dest="describe", metavar="DEVICE",
                     help="every descriptor of one device, decoded, then exit")
     ap.add_argument("--version", "-V", action="store_true",
                     help="print the version, then exit")
-    ap.add_argument("--hid", metavar="ADDR",
+    ap.add_argument("--hid", metavar="DEVICE",
                     help="dump the HID report descriptors of one device, then exit")
-    ap.add_argument("--interrogate", metavar="ADDR",
+    ap.add_argument("--interrogate", metavar="DEVICE",
                     help="question a held device over endpoint 0: every string, the "
                          "descriptors nothing else asks for, and where its claims "
                          "disagree with its live state")
