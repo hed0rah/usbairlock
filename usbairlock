@@ -13,6 +13,8 @@
     ./usbairlock --list                  every device and its addresses
     ./usbairlock --list -q               ...without the hint. -qq for bare rows, to pipe
     ./usbairlock --list -x               ...only what somebody plugged in
+    sudo ./usbairlock --inspect          every device, full detail, verdicts, then exit
+    sudo ./usbairlock --describe         every device, every descriptor byte, then exit
     ./usbairlock --write-config          print a config file to stdout
 
 How deep to look at ONE device, shallowest first. Every DEVICE accepts any of the four
@@ -269,7 +271,7 @@ def do_arm(cfg, disarm=False, porc=False):
         p(f"  {C['Y']}these persist until you run --disarm{C['N']}")
     return 0
 
-def do_inspect(cfg, target=None, porc=False):
+def do_inspect(cfg, target=None, porc=False, quiet=0):
     snap = usbinfo.snapshot()
     if target:
         # Match on ADDRESS, not just vid:pid, so two identical devices are separable.
@@ -295,7 +297,7 @@ def do_inspect(cfg, target=None, porc=False):
                 porcelain("threat", addr=usbinfo.addr_of(m.get("sysfs")),
                           id=m["id"], level=lvl, claim=headline)
         else:
-            d = show_device(m["id"], m["name"], cfg, meta=m, quiet=a.quiet)
+            d = show_device(m["id"], m["name"], cfg, meta=m, quiet=quiet)
             th = usbinfo.threats(d)
         for lvl, _, _ in th:
             worst = max(worst, {"LOW":1,"MED":2,"HIGH":3}[lvl])
@@ -1095,8 +1097,10 @@ def main():
     # like --inspect and --hid, not a verbosity level. Named --verbose it both read as a
     # modifier ("--list --verbose") and held -v hostage from --version, and the author of
     # the flag still tripped over it. The old spelling keeps working.
-    ap.add_argument("--describe", "--verbose", dest="describe", metavar="DEVICE",
-                    help="every descriptor of one device, decoded, then exit")
+    ap.add_argument("--describe", "--verbose", dest="describe", nargs="?", const=True,
+                    metavar="DEVICE",
+                    help="every descriptor of one device, decoded, then exit. With no "
+                         "DEVICE, every attached device in turn")
     ap.add_argument("--version", "-V", action="store_true",
                     help="print the version, then exit")
     ap.add_argument("--hid", metavar="DEVICE",
@@ -1175,7 +1179,28 @@ def main():
               + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
               + f"{C['N']}")
         return 0 if done else 1
-    if a.describe: return do_describe(a.describe)
+    if a.describe:
+        if a.describe is not True:
+            return do_describe(a.describe)
+        # No device named: walk the whole bus. The per-device commands all took exactly
+        # one target, so the deepest view had no way to cover a machine in one shot --
+        # which is what you want when triaging a box rather than a single suspect.
+        rc = 0
+        targets = [usbinfo.addr_of(d) for d in sorted(
+            usbinfo.resolve_all() if hasattr(usbinfo, "resolve_all") else [],
+            key=usbinfo.sort_key_path if hasattr(usbinfo, "sort_key_path") else str)]
+        if not targets:
+            import glob as _g
+            targets = sorted((usbinfo.addr_of(d) for d in _g.glob("/sys/bus/usb/devices/*/")
+                              if usbinfo._attr(d, "idVendor")), key=usbinfo.sort_key)
+        if a.external_only:
+            targets = [t for t in targets
+                       if not usbinfo.is_internal(
+                           usbinfo._attr("/sys/bus/usb/devices/%s/" % t, "removable"), t)]
+        for t in targets:
+            rc = max(rc, do_describe(t) or 0)
+        p(f"  {C['D']}{len(targets)} device(s) described{C['N']}\n")
+        return rc
     if a.hid: return do_hid(a.hid, a.porcelain)
     if a.interrogate: return do_interrogate(a.interrogate, a.porcelain)
     if a.forget: return do_forget(a.porcelain)
@@ -1186,7 +1211,8 @@ def main():
     if a.diagnose: return do_diagnose(a.porcelain)
     if a.disarm: return do_arm(cfg, disarm=True, porc=a.porcelain)
     if a.arm: return do_arm(cfg, porc=a.porcelain)
-    if a.inspect: return do_inspect(cfg, None if a.inspect is True else a.inspect, a.porcelain)
+    if a.inspect: return do_inspect(cfg, None if a.inspect is True else a.inspect,
+                                    a.porcelain, a.quiet)
     if a.capture: return do_capture(cfg, a.capture, a.iface, a.endpoint, None)
 
     # SINGLE INSTANCE. Two monitors would both apply protections and both register

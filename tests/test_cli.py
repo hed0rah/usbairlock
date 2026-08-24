@@ -95,6 +95,17 @@ def main():
     check("and the old spelling still works, it shipped",
           "unrecognized" in run("--list", "--allow-existing")[1], False)
 
+    # -- whole-bus forms ---------------------------------------------------------------
+    # Bare --inspect regressed to a NameError when quiet was threaded through, and nothing
+    # noticed because no test ran it without a target. Every mode that accepts a bare form
+    # is exercised here now.
+    rc, out = run("--inspect")
+    check("bare --inspect does not crash", "Traceback" in out, False)
+    check("and reports on more than one device", out.count("present") > 1 or rc in (0, 2), True)
+    rc, out = run("--describe")
+    check("bare --describe walks the bus", "Traceback" in out, False)
+    check("and says how many it covered", "device(s) described" in out, True)
+
     # -- help still works and is not the argparse default ---------------------------
     rc, out = run("--help")
     check("--help exits 0", rc, 0)
