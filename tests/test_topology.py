@@ -79,6 +79,28 @@ def main():
     check("an address we know nothing about is not opaque",
           usbinfo.blinds_downstream("1-9", auth2, True), False)
 
+    # -- the interface gate makes a hub opaque too, and that is the DEFAULT -----------
+    # Found on hardware 2026-08-23. withhold_interface leaves the device authorized and
+    # shuts the interface, so a hub held by the default configuration was every bit as
+    # opaque and the warning never fired. The test is the driver, not the device gate.
+    check("a hub with no driver is opaque even though the DEVICE is authorized",
+          usbinfo.blinds_downstream("1-4", {"1-4": "1"}, True, "none"), True)
+    check("and the same for an empty driver field",
+          usbinfo.blinds_downstream("1-4", {"1-4": "1"}, True, ""), True)
+    check("and for the dash the listing uses when there is nothing",
+          usbinfo.blinds_downstream("1-4", {"1-4": "1"}, True, "-"), True)
+    check("a hub WITH the hub driver bound is not opaque",
+          usbinfo.blinds_downstream("1-4", {"1-4": "1"}, True, "hub"), False)
+    check("the device gate still counts on its own, driver or not",
+          usbinfo.blinds_downstream("1-4", {"1-4": "0"}, True, "hub"), True)
+    check("a root hub is still never opaque, even driverless",
+          usbinfo.blinds_downstream("usb1", {"usb1": "1"}, True, "none"), False)
+    check("a driverless NON-hub is not opaque, it is just unbound",
+          usbinfo.blinds_downstream("1-4", {"1-4": "1"}, False, "none"), False)
+    # A caller with no driver information must not have one invented for it.
+    check("driver omitted falls back to the device gate alone",
+          usbinfo.blinds_downstream("1-4", {"1-4": "1"}, True), False)
+
     # stranded_by is kept for a tree someone ELSE deauthorized, where the children did
     # enumerate first. It is simply not reachable through this tool's own gate.
     check("stranded_by still describes a hand-deauthorized tree",

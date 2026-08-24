@@ -71,6 +71,17 @@ def main():
     # -q must not become an error the way -v did
     check("-q is accepted, not rejected", "unrecognized" in q1, False)
 
+    # -- interrogate -----------------------------------------------------------------
+    # Every request it makes is DEVICE-directed, so it must work with the interface gate
+    # shut. It also must not pretend: a device that refuses a request is a fact, not an
+    # error, and unreadable state must never be reported as a clean bill of health.
+    rc, out = run("--interrogate", "definitely-not-a-device")
+    check("a miss is reported, not crashed", "no device matches" in out, True)
+    check("and exits non-zero", rc != 0, True)
+
+    rc, out = run("--interrogate")
+    check("--interrogate requires an address", rc != 0, True)
+
     # -- help still works and is not the argparse default ---------------------------
     rc, out = run("--help")
     check("--help exits 0", rc, 0)

@@ -85,6 +85,41 @@ def dev_dir(spec):
     return hits[0] if hits else None
 
 
+def endpoint_packet_size(spec, interface, endpoint, default=8):
+    """wMaxPacketSize for one endpoint, from sysfs. Bytes.
+
+    This exists because the read below asked usbfs for a fixed 8 bytes, which is the
+    size of a BOOT keyboard report but not of the endpoint that carries it. usbfs
+    returns EOVERFLOW when the device sends a packet larger than the transfer asked
+    for, so any HID interface with a bigger interrupt endpoint could not be captured
+    at all -- it was detected, blocked, and then
+
+        capture failed 146d:c529 [Errno 75] Value too large for defined data type
+
+    Observed 2026-08-23 with a Flipper Zero running BadUSB, whose endpoint is 16 bytes.
+    NKRO keyboards and anything using report IDs are the same shape. The class of device
+    this program exists for was the class it could not record.
+    """
+    d = dev_dir(spec)
+    if not d:
+        return default
+    import glob as _glob
+    want = "ep_%02x" % (endpoint & 0xFF)
+    base = os.path.basename(d.rstrip("/"))
+    pats = [os.path.join(d, "%s:*.%d" % (base, interface), want, "wMaxPacketSize"),
+            os.path.join(d, "*:*", want, "wMaxPacketSize")]      # fallback, any interface
+    for pat in pats:
+      for path in sorted(_glob.glob(pat)):
+        try:
+            # sysfs prints it as hex with no prefix. The low 11 bits are the size; bits
+            # 11-12 are the additional-transactions field on high-speed periodic
+            # endpoints and are not part of it.
+            return max(default, int(open(path).read().strip(), 16) & 0x7FF)
+        except Exception:
+            pass
+    return default
+
+
 def find_node(spec):
     """/dev/bus/usb/BBB/DDD for a device spec, read from sysfs."""
     d = dev_dir(spec)
@@ -95,6 +130,133 @@ def find_node(spec):
         return f"/dev/bus/usb/{b:03d}/{n:03d}"
     except Exception:
         return None
+
+def control_in(node_or_spec, bRequestType, bRequest, wValue, wIndex, length,
+               timeout=1000):
+    """One device-to-host control transfer on endpoint 0. Returns bytes, or None.
+
+    Endpoint 0 belongs to the DEVICE, not to any interface, so every standard request
+    here works while the interface gate is shut and no driver is bound. That is the whole
+    reason --interrogate exists: a device held at the airlock can still be made to answer
+    for itself, in detail, with no ability to act.
+
+    Returns None on any refusal. A device declining a request is a FACT about the device,
+    not an error here, and the caller reports it as such.
+    """
+    node = node_or_spec if str(node_or_spec).startswith("/dev/") else find_node(node_or_spec)
+    if not node:
+        return None
+    length = max(0, min(int(length), 65535))
+    buf = ctypes.create_string_buffer(length or 1)
+    ct = _CtrlTransfer(bRequestType=bRequestType, bRequest=bRequest, wValue=wValue,
+                       wIndex=wIndex, wLength=length, timeout=timeout,
+                       data=ctypes.cast(buf, ctypes.c_void_p))
+    try:
+        fd = os.open(node, os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        n = fcntl.ioctl(fd, USBDEVFS_CONTROL, ct)
+        return bytes(buf.raw[:n]) if n and n >= 0 else None
+    except OSError:
+        return None
+    finally:
+        try: os.close(fd)
+        except Exception: pass
+
+
+# GET_DESCRIPTOR types worth asking for by hand. The kernel fetches DEVICE and CONFIG
+# during enumeration and caches them; the rest it never requests, so they are only
+# visible if you ask.
+DESC_DEVICE, DESC_CONFIG, DESC_STRING = 1, 2, 3
+DESC_QUALIFIER, DESC_OTHER_SPEED, DESC_BOS = 6, 7, 15
+
+
+def get_descriptor(spec, dtype, index=0, length=255, lang=0):
+    return control_in(spec, 0x80, 0x06, (dtype << 8) | index, lang, length)
+
+
+def get_status(spec):
+    """Device status: bit 0 self-powered, bit 1 remote-wakeup ENABLED.
+
+    Worth having because the configuration descriptor says what a device is CAPABLE of;
+    this says what is currently switched on. A device with remote wakeup actually enabled
+    can bring the machine out of suspend.
+    """
+    b = control_in(spec, 0x80, 0x00, 0, 0, 2)
+    return (b[0] | (b[1] << 8)) if b and len(b) >= 2 else None
+
+
+def get_configuration(spec):
+    b = control_in(spec, 0x80, 0x08, 0, 0, 1)
+    return b[0] if b else None
+
+
+def string_descriptor(spec, index, lang=0x0409):
+    """One string descriptor, decoded from UTF-16LE. None if the device refuses."""
+    if not index:
+        return None
+    b = get_descriptor(spec, DESC_STRING, index, 255, lang)
+    if not b or len(b) < 4 or b[1] != DESC_STRING:
+        return None
+    try:
+        return b[2:b[0] if b[0] <= len(b) else len(b)].decode("utf-16-le", "replace").strip("\x00")
+    except Exception:
+        return None
+
+
+def string_languages(spec):
+    """String descriptor 0 is the list of LANGIDs the device supports."""
+    b = get_descriptor(spec, DESC_STRING, 0, 255, 0)
+    if not b or len(b) < 4:
+        return []
+    return [b[i] | (b[i + 1] << 8) for i in range(2, min(b[0], len(b)) - 1, 2)]
+
+
+MS_OS_STRING_INDEX = 0xEE
+
+
+def ms_os_descriptor(spec):
+    """Microsoft OS descriptors: (vendor_code, compat_ids) or None.
+
+    A two-step handshake. String index 0xEE returns a signature 'MSFT100' plus a
+    vendor-specific bRequest code, which is then used for a vendor control transfer that
+    returns the Extended Compat ID descriptor.
+
+    This is a strong impersonation check and it costs one transfer. Real mass-market
+    hardware overwhelmingly implements it, because Windows asks every device on first
+    enumeration. A cheap board claiming to BE that hardware usually does not, because
+    nothing on Linux ever asks and the author never noticed. A device answering
+    146d:c529 that cannot answer what a genuine one answers has been caught by its own
+    silence.
+    """
+    b = get_descriptor(spec, DESC_STRING, MS_OS_STRING_INDEX, 18, 0)
+    if not b or len(b) < 16 or b[1] != DESC_STRING:
+        return None
+    try:
+        sig = b[2:16].decode("utf-16-le", "replace")
+    except Exception:
+        return None
+    if not sig.startswith("MSFT100"):
+        return None
+    vendor_code = b[16] if len(b) > 16 else None
+    if vendor_code is None:
+        return (None, [])
+    # 0xC0 = device-to-host | vendor | recipient=device, wIndex 0x0004 = compat IDs
+    ext = control_in(spec, 0xC0, vendor_code, 0, 0x0004, 0x28)
+    compat = []
+    if ext and len(ext) >= 16:
+        count = ext[16] if len(ext) > 16 else 0
+        for i in range(count):
+            off = 16 + 8 + i * 24
+            if off + 16 > len(ext):
+                break
+            cid = ext[off + 2:off + 10].split(b"\x00")[0].decode("ascii", "replace")
+            sub = ext[off + 10:off + 18].split(b"\x00")[0].decode("ascii", "replace")
+            if cid or sub:
+                compat.append((cid, sub))
+    return (vendor_code, compat)
+
 
 def hid_driver_present():
     return os.path.isdir("/sys/bus/usb/drivers/usbhid")
@@ -448,8 +610,10 @@ def capture(vid_pid, interface=0, endpoint=0x81, on_event=None, on_lost=None, se
                               "a 32-bit one. Such a device cannot be claimed at all",
             }.get(e.errno, str(e))
             raise RuntimeError(f"cannot claim interface {interface}: {why}") from e
-        buf = ctypes.create_string_buffer(8)
-        bt = _BulkTransfer(ep=endpoint, len=8, timeout=1000,
+        # Ask for what the endpoint can actually send, not what a boot report weighs.
+        size = endpoint_packet_size(vid_pid, interface, endpoint)
+        buf = ctypes.create_string_buffer(size)
+        bt = _BulkTransfer(ep=endpoint, len=size, timeout=1000,
                            data=ctypes.cast(buf, ctypes.c_void_p))
         started, prev = time.time(), set()
         while True:
@@ -467,7 +631,10 @@ def capture(vid_pid, interface=0, endpoint=0x81, on_event=None, on_lost=None, se
                 # a device held unauthorized never gets configured, so cheap HID firmware
                 # assumes a bad link and resets itself, which changes devnum and leaves
                 # this fd pointing at nothing. Re-resolve and reclaim rather than dying.
-                if e.errno in (108, 19, 32):
+                # 108 ESHUTDOWN, 19 ENODEV, 32 EPIPE, 71 EPROTO. EPROTO was fatal
+                # until a YubiKey threw one during a replug and took the capture down
+                # with it, while the device sat there perfectly healthy.
+                if e.errno in (108, 19, 32, 71):
                     if on_lost: on_lost()
                     raise _Reconnect()
                 raise

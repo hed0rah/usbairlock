@@ -213,6 +213,79 @@ def main():
           ui.attachment("unknown"), None)
     check("missing says nothing", ui.attachment(None), None)
 
+    # -- report-ID prefixed reports --------------------------------------------------
+    # A Flipper Zero running BadUSB sends 16-byte reports beginning with report ID 0x01,
+    # so byte 0 was read as the modifier bitmap and bit 0 is LCTRL. Every key of the
+    # payload decoded as CTRL+something while the letters came out perfect, because
+    # report[2:8] still landed on keycodes once the zero reserved byte was filtered.
+    # Modifiers are the half that matters: GUI+r is what opens the box.
+    boot_p    = bytes([0x00, 0x00, 0x13, 0, 0, 0, 0, 0])
+    boot_gui  = bytes([0x08, 0x00, 0x15, 0, 0, 0, 0, 0])
+    pre_p     = bytes([0x01, 0x00, 0x00, 0x13, 0, 0, 0, 0]) + bytes(8)
+    pre_gui   = bytes([0x01, 0x08, 0x00, 0x15, 0, 0, 0, 0]) + bytes(8)
+
+    check("an 8-byte report is never treated as prefixed",
+          rules.report_is_prefixed(boot_p), False)
+    check("a long report starting with a small constant is",
+          rules.report_is_prefixed(pre_p), True)
+    check("boot: a plain key is text, no chord",
+          rules.decode_hid_report(boot_p, set())[:2], ("p", []))
+    check("boot: GUI+r is a chord, not text",
+          rules.decode_hid_report(boot_gui, set())[:2], ("", ["GUI+r"]))
+    check("prefixed: a plain key is text, NOT ctrl+key",
+          rules.decode_hid_report(pre_p, set())[:2], ("p", []))
+    check("prefixed: GUI+r survives the shift",
+          rules.decode_hid_report(pre_gui, set())[:2], ("", ["GUI+r"]))
+    # the exact regression: this used to yield CTRL+p
+    check("a prefixed plain key produces no CTRL chord at all",
+          any("CTRL" in c for c in rules.decode_hid_report(pre_p, set())[1]), False)
+    check("the caller can force the interpretation either way",
+          rules.decode_hid_report(pre_p, set(), prefixed=False)[1] != [], True)
+    check("a report too short to hold a prefixed boot report decodes to nothing",
+          rules.decode_hid_report(bytes(8) , set(), prefixed=True)[:2], ("", []))
+
+    # -- usage pages -----------------------------------------------------------------
+    # 0xF1D0 is FIDO's. It is not in 0xFF00-0xFFFF, so keying "vendor-defined" to that
+    # range meant a YubiKey's 64-byte bidirectional pipe was flagged as nothing.
+    check("0xf1d0 is non-standard even though we can name it",
+          rules.nonstandard_page(0xF1D0), True)
+    check("and it is named, not printed as a bare number",
+          "FIDO" in rules.page_name(0xF1D0), True)
+    check("standard pages are not non-standard", rules.nonstandard_page(0x01), False)
+    check("the boundary is 0x92", (rules.nonstandard_page(0x91),
+                                   rules.nonstandard_page(0x92)), (False, True))
+
+    fido = bytes([0x06,0xD0,0xF1,0x09,0x01,0xA1,0x01,
+                  0x09,0x20,0x15,0x00,0x26,0xFF,0x00,0x75,0x08,0x95,0x40,0x81,0x02,
+                  0x09,0x21,0x15,0x00,0x26,0xFF,0x00,0x75,0x08,0x95,0x40,0x91,0x02,0xC0])
+    parsed = rules.parse_report_descriptor(fido)
+    check("OUTPUT items are parsed, not just INPUT", len(parsed["outputs"]), 1)
+    check("and their page reaches the page set", 0xF1D0 in parsed["pages"], True)
+    heads = [h for _l, h, _d in rules.capability_threats(parsed)]
+    check("a non-standard page is called a channel",
+          any("vendor-defined channel" in h for h in heads), True)
+    check("and a host-to-device path on it is called out",
+          any("bidirectional" in h for h in heads), True)
+
+    # Whose claim is it. A GenesysLogic hub reported removable=fixed for one of its own
+    # ports on 2026-08-23, and the tool rendered a keyboard on an EXTERNAL hub as
+    # "internal, soldered to this machine" -- a hub's self-assertion presented as a fact
+    # about the machine's construction, which is a trust signal a hostile hub can forge.
+    check("a root-hub port is the machine's own claim, and stays plain",
+          "soldered" in (ui.attachment("fixed", "1-14") or ""), True)
+    check("the same bit behind an external hub is attributed to that hub",
+          "hub's claim" in (ui.attachment("fixed", "1-4.4") or ""), True)
+    check("and never says soldered",
+          "soldered" in (ui.attachment("fixed", "1-4.4") or ""), False)
+    check("removable behind an external hub says where it is",
+          "external hub" in (ui.attachment("removable", "1-4.1") or ""), True)
+    check("a hub plugged into a ROOT hub is still the machine's own port",
+          "soldered" in (ui.attachment("fixed", "1-4") or ""), True)
+    check("no address falls back to the unqualified wording",
+          "soldered" in (ui.attachment("fixed") or ""), True)
+    check("an unreadable value still says nothing, address or not",
+          ui.attachment("unknown", "1-4.4"), None)
+
     # link speed: only the unambiguous case, or the signal drowns in normal devices
     check("usb3 on a 2.0 path is flagged",
           "USB 2 path" in (ui.link_note("3.00", "480") or ""), True)

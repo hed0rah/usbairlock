@@ -78,14 +78,51 @@ def to_int(v, default=0):
     except ValueError:
         return default
 
-def decode_hid_report(report, previous):
-    """(text, chords, keys_now) from one 8-byte boot-protocol report.
+def report_is_prefixed(report):
+    """Does this report start with a report ID rather than the modifier byte?
+
+    A boot-protocol keyboard report is 8 bytes: [modifiers][reserved][6 keycodes]. A
+    device that declares Report ID items prefixes every report with the ID, shifting
+    everything by one: [id][modifiers][reserved][keycodes].
+
+    Getting this wrong is not subtle, and a Flipper Zero running BadUSB demonstrated it
+    on 2026-08-23. Its reports are 16 bytes and begin with report ID 0x01, so byte 0 was
+    read as the modifier bitmap, whose bit 0 is LCTRL. Every keystroke of the payload
+    came out as CTRL+something:
+
+        CHORD  146d:c529  CTRL+p
+        CHORD  146d:c529  CTRL+o
+        CHORD  146d:c529  CTRL+w      ...spelling "powershell" in chords
+
+    The letters were right, because report[2:8] still landed on real keycodes once the
+    zero reserved byte was filtered. Only the modifiers were fiction -- and modifiers are
+    the part that matters, since GUI+r is what opens the box.
+
+    The tell is structural. In the boot layout byte 1 is RESERVED and always zero. In the
+    prefixed layout byte 2 is the reserved one, and byte 0 is a small constant ID. So a
+    report whose byte 1 is non-zero while byte 2 is zero cannot be a boot report, and a
+    longer-than-boot report whose first byte is a plausible ID is prefixed.
+    """
+    if len(report) <= 8:
+        return False
+    if report[1] and not report[2]:          # byte 1 carries modifiers, byte 2 reserved
+        return True
+    return 0 < report[0] <= 0x0F and not report[2]
+
+
+def decode_hid_report(report, previous, prefixed=None):
+    """(text, chords, keys_now) from one boot-protocol keyboard report.
 
     `previous` is the keycode set from the last report, so a held key does not repeat.
+    `prefixed` forces the report-ID interpretation; None auto-detects. See
+    report_is_prefixed() for why this exists.
     """
     if len(report) < 8: return "", [], set()
-    mod = report[0]
-    keys = set(k for k in report[2:8] if k)
+    off = report_is_prefixed(report) if prefixed is None else bool(prefixed)
+    if off and len(report) < 9: return "", [], set()
+    base = 1 if off else 0
+    mod = report[base]
+    keys = set(k for k in report[base + 2:base + 8] if k)
     fresh = keys - previous
     shift = bool(mod & 0x22)
     names = set(n for bit, n in MODIFIERS if mod & bit)
@@ -269,7 +306,25 @@ USAGE_PAGES = {
     0x05: "game", 0x06: "generic device", 0x07: "keyboard", 0x08: "LED",
     0x09: "button", 0x0A: "ordinal", 0x0B: "telephony", 0x0C: "consumer",
     0x0D: "digitizer", 0x0F: "PID", 0x10: "unicode", 0x14: "alphanumeric display",
+    # Outside the standard block but universally allocated in practice. Naming these
+    # turns "unknown page 0xf1d0" into "this is a security key", which is the difference
+    # between a reader investigating and a reader shrugging.
+    0xF1D0: "FIDO alliance", 0xFF00: "vendor-defined",
 }
+
+# The standard pages stop at 0x14 with a few gaps. Everything from 0x92 up is either
+# reserved-and-unassigned or explicitly vendor-defined, and BOTH mean "no standard
+# semantics, the device decides what these bytes are". Treating only 0xFF00+ as
+# non-standard missed 0xF1D0 entirely -- a YubiKey's 64-byte bidirectional FIDO pipe was
+# not flagged as a channel at all on 2026-08-23, and an attacker can pick any of the
+# thousands of unassigned pages below 0xFF00 to get the same silence.
+def nonstandard_page(page):
+    # Being NAMEABLE is not the same as being standard. Adding 0xF1D0 to the table above
+    # so it prints nicely immediately made this return False for it, which would have
+    # un-flagged the very device that exposed the gap. Standard HID usage pages all live
+    # below 0x92; everything at or above that is the device's own territory whether or
+    # not this program happens to know a name for it.
+    return page is not None and page >= 0x92
 
 # Generic-desktop usages worth naming, because "generic desktop" alone says nothing.
 DESKTOP_USAGE = {0x01: "pointer", 0x02: "mouse", 0x04: "joystick", 0x05: "gamepad",
@@ -279,9 +334,16 @@ DESKTOP_USAGE = {0x01: "pointer", 0x02: "mouse", 0x04: "joystick", 0x05: "gamepa
 def page_name(page):
     if page is None:
         return "?"
+    known = USAGE_PAGES.get(page)
+    if known and page >= 0x92:
+        return "%s (0x%04x)" % (known, page)
+    if known:
+        return known
     if 0xFF00 <= page <= 0xFFFF:
         return "vendor-defined 0x%04x" % page
-    return USAGE_PAGES.get(page, "0x%04x" % page)
+    if nonstandard_page(page):
+        return "unassigned 0x%04x" % page
+    return "0x%04x" % page
 
 
 def parse_report_descriptor(data):
@@ -296,7 +358,8 @@ def parse_report_descriptor(data):
     truncated or nonsense descriptor, and refusing to report anything would hand it the
     outcome it wanted. Anything unparseable ends the walk and sets truncated.
     """
-    out = {"inputs": [], "pages": [], "collections": [], "truncated": False}
+    out = {"inputs": [], "outputs": [], "features": [],
+           "pages": [], "collections": [], "truncated": False}
     if not data:
         return out
     b = bytes(data)
@@ -332,9 +395,10 @@ def parse_report_descriptor(data):
                 # where "this is a mouse" actually lives -- an Input item inside it
                 # carries X/Y, not the word mouse. Record it before it is cleared.
                 out["collections"].append({"page": page, "usage": usages[0]})
-            if tag == 0x8:                 # Input
+            if tag in (0x8, 0x9, 0xB):     # Input / Output / Feature
                 seen = sorted(set(usages))
-                out["inputs"].append({
+                bucket = {0x8: "inputs", 0x9: "outputs", 0xB: "features"}[tag]
+                out[bucket].append({
                     "page": page,
                     "page_name": page_name(page),
                     "usages": seen,
@@ -344,7 +408,10 @@ def parse_report_descriptor(data):
                 })
             # Main items clear the local state whatever they were
             usages = []
-    out["pages"] = sorted({d["page"] for d in out["inputs"] if d["page"] is not None})
+    # Pages from EVERY direction. A vendor page that appears only in an Output item is
+    # still a channel, and keying this off inputs alone hid exactly that case.
+    out["pages"] = sorted({d["page"] for k in ("inputs", "outputs", "features")
+                           for d in out[k] if d["page"] is not None})
     return out
 
 
@@ -397,8 +464,18 @@ def capability_threats(parsed):
     if 0x07 in pages or 0x06 in desktop: types.add("keyboard")
     if 0x02 in desktop or 0x01 in desktop: types.add("pointer")
     if 0x0C in pages: types.add("consumer control")
-    vendor = sorted(p for p in pages if 0xFF00 <= p <= 0xFFFF)
+    # Every page the device decides the meaning of, not just the 0xFF00 block. See
+    # nonstandard_page(): keying this to 0xFF00+ missed 0xF1D0 and every other
+    # unassigned page an attacker is free to pick.
+    vendor = sorted(p for p in pages if nonstandard_page(p))
     if vendor: types.add("vendor-defined channel")
+
+    # Direction. An Output or Feature item on one of those pages is a HOST-TO-DEVICE
+    # path with no defined semantics -- the shape of command and control, and the half
+    # the parser did not even read until a YubiKey's 64-byte bidirectional FIDO pipe
+    # went through here reported as nothing at all.
+    back = sorted({d["page"] for k in ("outputs", "features")
+                   for d in parsed.get(k, []) if nonstandard_page(d.get("page"))})
 
     if "keyboard" in types and len(types) > 1:
         others = sorted(types - {"keyboard"})
@@ -410,8 +487,14 @@ def capability_threats(parsed):
                     "not merely a HID class claim: it declares the reports"))
     if vendor:
         out.append(("MED", "declares a vendor-defined channel (%s)" %
-                    ", ".join("0x%04x" % p for p in vendor),
+                    ", ".join(page_name(p) for p in vendor),
                     "opaque by design; the class code does not describe it"))
+    if back:
+        out.append(("MED", "that channel is bidirectional (%s)" %
+                    ", ".join(page_name(p) for p in back),
+                    "it declares reports the HOST sends to IT, on a page with no "
+                    "standard meaning. Legitimate for a security key; also the shape "
+                    "of a command channel"))
     return out
 
 

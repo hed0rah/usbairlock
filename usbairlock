@@ -19,6 +19,10 @@ How deep to look at ONE device, shallowest first. Each takes an address from --l
     sudo ./usbairlock --describe ADDR    EVERY descriptor byte, decoded, with a receipt
                                          proving none were skipped. The deepest view
                                          there is, and more than `lsusb -v` prints
+    sudo ./usbairlock --interrogate ADDR ASK it things, over endpoint 0, while the gate
+                                         is still shut: every string index, the
+                                         descriptors nothing else requests, and where
+                                         its claims disagree with its live state
 
 One monitor runs at a time. A second one is refused rather than allowed to fight it over
 the same kernel settings. From any other terminal:
@@ -121,7 +125,8 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None):
         note = usbinfo.link_note(d.get("usb_version"), d.get("speed"))
         if note:
             p(f"                 {C['Y']}slow link{C['N']}  {C['D']}{note}{C['N']}")
-        att = usbinfo.attachment(d.get("removable"))
+        att = usbinfo.attachment(d.get("removable"), d.get("addr") or
+                                 usbinfo.addr_of(d.get("sysfs")))
         if att:
             p(f"                 {C['D']}port: {att}{C['N']}")
         qk = usbinfo.quirk_names(d.get("quirks"))
@@ -345,8 +350,42 @@ def porcelain(kind, **kw):
     parts = [kind] + [f"{k}={v}" for k, v in kw.items()]
     print("\t".join(str(x).replace("\t", " ") for x in parts), flush=True)
 
-def _hid_interfaces(d):
-    return [i for i in d.get("interfaces", []) if usbinfo.rules.to_int(i.get("cls")) == 0x03]
+# HID boot protocol, from the interface descriptor: 1 keyboard, 2 mouse, 0 neither.
+#
+# The capture path decodes an 8-byte BOOT KEYBOARD report -- byte 0 modifiers, bytes 2..7
+# keycodes. A mouse's boot report is buttons / dX / dY / wheel, so aiming that decoder at
+# one turns cursor movement into keycodes and prints it under the label TYPED. Observed on
+# hardware 2026-08-23: moving a PixArt optical mouse produced
+#
+#     TYPED  093a:2510  <CAPS>y1<PRTSC>z<INS>s<PAUSE>pr<CAPS>el<ENTER>
+#
+# which is this tool inventing the precise behaviour it exists to warn about. The device
+# said what it was the whole time -- bInterfaceProtocol 02, printed in the arrival line as
+# proto=2 -- and nothing read it. So only a keyboard is captured, and anything else HID is
+# reported as skipped with its protocol named, rather than decoded into fiction.
+HID_KEYBOARD, HID_MOUSE = "1", "2"
+_HID_PROTO_NAMES = {"0": "no boot protocol", HID_KEYBOARD: "keyboard", HID_MOUSE: "mouse"}
+
+
+def _hid_interfaces(d, keyboards_only=True):
+    hid = [i for i in d.get("interfaces", []) if usbinfo.rules.to_int(i.get("cls")) == 0x03]
+    if not keyboards_only:
+        return hid
+    return [i for i in hid if str(i.get("proto") or "0") == HID_KEYBOARD]
+
+
+def _hid_skip_reason(d):
+    """Why a HID device is not being captured, or None if it is a keyboard.
+
+    Only called when there IS a HID interface, so an empty keyboard list means every one
+    of them is something else.
+    """
+    others = _hid_interfaces(d, keyboards_only=False)
+    if not others or _hid_interfaces(d):
+        return None
+    protos = sorted({str(i.get("proto") or "0") for i in others})
+    named = ", ".join(_HID_PROTO_NAMES.get(x, f"protocol {x}") for x in protos)
+    return f"HID but not a keyboard ({named}), so there is nothing to record"
 
 def _drop_capture(capturing, vp, release=False):
     """Remove every capture for a vid:pid, optionally stopping it first.
@@ -441,7 +480,8 @@ def do_describe(spec):
             ("configurations", x.get("n_configs"))]
     for k in ("manufacturer", "product", "serial"):
         if dev.get(k): rows.append((k, dev[k]))
-    att = usbinfo.attachment(dev.get("removable"))
+    att = usbinfo.attachment(dev.get("removable"), dev.get("addr") or
+                             usbinfo.addr_of(dev.get("sysfs")))
     if att: rows.append(("port", att))
     loc = usbinfo.port_location(d)
     if loc: rows.append(("physical", loc))
@@ -507,6 +547,149 @@ def do_describe(spec):
       f"{', all accounted for' if ok else ', SOME NOT PARSED'}{C['N']}")
     p()
     return 0
+
+
+def do_interrogate(spec, porc=False):
+    """Ask a held device to account for itself, over endpoint 0.
+
+    Everything here is a DEVICE-directed control request, so it works while the interface
+    gate is shut and no driver is bound: full declared capability, zero ability to act.
+    That is the point. Enumeration caches the device and configuration descriptors and
+    nothing else, so the rest is invisible unless something asks -- and nothing on a Linux
+    box ever asks.
+
+    The interesting output is not the descriptors, it is the DISAGREEMENTS. A descriptor
+    is a claim written once at the factory. GET_STATUS is the device answering about
+    itself right now. Where they differ is where a device is worth looking at.
+    """
+    hits = usbinfo.resolve(spec)
+    if not hits:
+        p(f"\n  {C['R']}no device matches {spec}{C['N']}"); return 1
+    dev = hits[0]
+    addr = usbinfo.addr_of(dev)
+    vp = usbinfo.id_of(dev) or "?"
+    if not protect.is_root():
+        p(f"\n  {C['R']}--interrogate needs root{C['N']}  "
+           f"{C['D']}control transfers go through /dev/bus/usb{C['N']}")
+        return 1
+
+    def attr(name):
+        try: return open(os.path.join(dev, name)).read().strip()
+        except Exception: return None
+
+    p(f"\n  {C['W']}{addr}{C['N']}  {vp}  {attr('product') or '(no product string)'}")
+    rule()
+
+    # ---- what the DEVICE says when asked, right now ------------------------------
+    langs = capmod.string_languages(addr)
+    status = capmod.get_status(addr)
+    active = capmod.get_configuration(addr)
+    p(f"  {C['C']}live state{C['N']}  {C['D']}(endpoint 0, no interface claimed){C['N']}")
+    p(f"      active configuration   {active if active is not None else 'refused'}")
+    if status is None:
+        p("      device status          refused")
+    else:
+        p(f"      device status          0x{status:04x}   self-powered={bool(status & 1)}   "
+           f"remote-wakeup armed={bool(status & 2)}")
+    p(f"      string languages       {', '.join('0x%04x' % l for l in langs) or 'none reported'}")
+
+    # ---- strings, INCLUDING indices no descriptor points at ----------------------
+    lang = langs[0] if langs else 0x0409
+    found = []
+    for i in range(1, 17):
+        v = capmod.string_descriptor(addr, i, lang)
+        if v:
+            found.append((i, v))
+    if found:
+        p(f"\n  {C['C']}string descriptors{C['N']}  {C['D']}every index that answers, not "
+           f"only the ones a descriptor references{C['N']}")
+        referenced = {attr('manufacturer'), attr('product'), attr('serial')} - {None}
+        for i, v in found:
+            tag = "" if v in referenced else f"   {C['Y']}unreferenced{C['N']}"
+            p(f"      [{i}] {usbinfo.safe_text(v)}{tag}")
+
+    # ---- descriptors the kernel never asks for -----------------------------------
+    p(f"\n  {C['C']}descriptors nothing else requests{C['N']}")
+    for label, dtype, why in (
+            ("device_qualifier", capmod.DESC_QUALIFIER,
+             "what it would be at its other speed"),
+            ("other_speed_config", capmod.DESC_OTHER_SPEED,
+             "the configuration it would present at that speed"),
+            ("BOS", capmod.DESC_BOS, "USB 3 capabilities and container id")):
+        b = capmod.get_descriptor(addr, dtype, 0, 255)
+        if b:
+            p(f"      {label:19}{len(b)} bytes   {C['D']}{b[:16].hex()}{C['N']}")
+        else:
+            p(f"      {label:19}{C['D']}refused ({why}){C['N']}")
+
+    # ---- microsoft os descriptors ------------------------------------------------
+    ms = capmod.ms_os_descriptor(addr)
+    p(f"\n  {C['C']}microsoft OS descriptors{C['N']}")
+    if ms is None:
+        p(f"      {C['D']}absent. Windows asks every device for these on first "
+           f"enumeration, so most mass-market hardware implements them and most "
+           f"hand-built firmware does not. Weak evidence on its own -- a HID device "
+           f"needs no compat id -- but telling when the device claims to BE something "
+           f"mass-market.{C['N']}")
+    else:
+        code, compat = ms
+        p(f"      present, vendor request code 0x{code:02x}")
+        for cid, sub_ in compat:
+            p(f"      compat id  {cid or '-'} / {sub_ or '-'}")
+        if not compat:
+            p(f"      {C['D']}signature present, no compat ids returned{C['N']}")
+
+    # ---- every configuration, not just the live one ------------------------------
+    ncfg = usbinfo.rules.to_int(attr("bNumConfigurations") or "1") or 1
+    if ncfg > 1:
+        p(f"\n  {C['C']}all {ncfg} configurations{C['N']}  "
+           f"{C['D']}only the active one is ever parsed by anything else{C['N']}")
+        for i in range(ncfg):
+            b = capmod.get_descriptor(addr, capmod.DESC_CONFIG, i, 512)
+            if not b or len(b) < 9:
+                p(f"      [{i}] refused"); continue
+            total = b[2] | (b[3] << 8)
+            p(f"      [{i}] value={b[5]}  {b[4]} interface(s)  {total} bytes  "
+               f"{b[8] * 2}mA" + (f"   {C['Y']}<- active{C['N']}" if b[5] == active else ""))
+
+    # ---- the part that matters ---------------------------------------------------
+    notes = []
+    if status is not None:
+        pc = usbinfo.power_claim(attr("bmAttributes")) or {}
+        claimed_self = bool(pc.get("self_powered"))
+        if claimed_self and not (status & 1):
+            notes.append(("MED", "descriptor claims self-powered, the device reports "
+                                 "bus-powered right now",
+                          "bmAttributes is a factory claim; GET_STATUS is the device "
+                          "answering about itself. Drawing from the bus while declaring "
+                          "otherwise misstates what it costs the host"))
+        if (status & 2):
+            notes.append(("MED", "remote wakeup is ARMED, not merely supported",
+                          "this device can bring the machine out of suspend"))
+    if ms is None and usbinfo.rules.to_int(attr("idVendor") or "0") in KNOWN_BIG_VENDORS:
+        notes.append(("MED", "claims a mass-market vendor id but has no MS OS descriptors",
+                      "not conclusive, and cheap legitimate hardware skips them too. "
+                      "Worth weighing with everything else"))
+    if len(found) > 3:
+        notes.append(("LOW", f"{len(found)} string descriptors answer, more than the "
+                             f"three a device descriptor references",
+                      "extra strings are not suspicious by themselves; they are simply "
+                      "content nothing else displays"))
+    if notes:
+        p(f"\n  {C['C']}disagreements{C['N']}")
+        for lvl, head, why in notes:
+            col = C['Y'] if lvl == "MED" else C['D']
+            p(f"      {col}[{lvl}]{C['N']} {head}")
+            p(f"             {C['D']}{why}{C['N']}")
+    else:
+        p(f"\n  {C['D']}nothing it said contradicts anything else it said{C['N']}")
+    p("")
+    return 0
+
+
+# Vendor ids big enough that a device claiming one is claiming to be mass-market
+# hardware. Used only to weight the MS OS descriptor observation, never on its own.
+KNOWN_BIG_VENDORS = {0x046D, 0x045E, 0x413C, 0x03F0, 0x04F2, 0x8087, 0x0BDA, 0x05E3}
 
 
 def do_hid(spec, porc=False):
@@ -787,7 +970,7 @@ def do_list(a):
     for r in rows:
         r["stranded"] = usbinfo.stranded_by(r["addr"], auth_by) or "-"
         r["blind"] = "1" if usbinfo.blinds_downstream(
-            r["addr"], auth_by, r["hub"] == "1") else "0"
+            r["addr"], auth_by, r["hub"] == "1", r.get("driver")) else "0"
 
     # parent before child, so indentation reads as the tree it is, and siblings in
     # port order rather than string order: 1-5 belongs above 1-14, not below it.
@@ -891,6 +1074,10 @@ def main():
                     help="print the version, then exit")
     ap.add_argument("--hid", metavar="ADDR",
                     help="dump the HID report descriptors of one device, then exit")
+    ap.add_argument("--interrogate", metavar="ADDR",
+                    help="question a held device over endpoint 0: every string, the "
+                         "descriptors nothing else asks for, and where its claims "
+                         "disagree with its live state")
     ap.add_argument("--forget", action="store_true",
                     help="clear the shared allow list, then exit")
     ap.add_argument("--force", action="store_true",
@@ -937,14 +1124,26 @@ def main():
         # Authorising writes sysfs, which a running monitor sees on its next poll.
         # The ALLOW LIST is separate: it is policy, and without recording it there the
         # monitor would withhold this same device again on the next replug.
-        if done and ipc.append_allow([a.authorize]):
+        #
+        # Record the vid:pid, NOT whatever the operator happened to type. The list was
+        # storing the raw argument, so `--authorize 1-4` wrote the ADDRESS while every
+        # match site tests vid:pid -- an entry nothing could ever match, under a message
+        # promising the device had been remembered. Found 2026-08-23 with a list reading
+        # "2109:2813 1-4.4 4-1 1-4 1-1", one real entry and four inert ones.
+        #
+        # Addresses would be the wrong key even if they were matched. A port is reusable:
+        # 1-1 was a hub earlier tonight and is a security key now. Trusting a PORT means
+        # authorising a hub and then inheriting that trust for whatever replaces it.
+        remember = sorted({usbinfo.id_of(h) for h in hits if usbinfo.id_of(h)})
+        if done and remember and ipc.append_allow(remember):
             pid = ipc.holder_pid()
-            p(f"  {C['D']}added to the shared allow list"
+            p(f"  {C['D']}remembered {' '.join(remember)}"
               + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
               + f"{C['N']}")
         return 0 if done else 1
     if a.describe: return do_describe(a.describe)
     if a.hid: return do_hid(a.hid, a.porcelain)
+    if a.interrogate: return do_interrogate(a.interrogate, a.porcelain)
     if a.forget: return do_forget(a.porcelain)
     if a.replay: return do_replay(a, a.replay)
     if a.list_devices: return do_list(a)
@@ -1234,6 +1433,9 @@ def main():
                     protect.note_withheld(now[k].get("sysfs"))
                 if vp in allow:
                     emit(f"                 {C['D']}on the allow list, admitted without recording{C['N']}")
+                elif a.auto and _hid_interfaces(d, keyboards_only=False) \
+                        and _hid_skip_reason(d):
+                    emit(f"                 {C['D']}not captured: {_hid_skip_reason(d)}{C['N']}")
                 elif a.auto and _hid_interfaces(d) and (addr0 or vp) not in capturing:
                     if not protect.is_root():
                         emit(f"                 {C['Y']}--auto needs root, skipping{C['N']}")

@@ -221,19 +221,40 @@ def port_location(devdir):
     return out
 
 
-def attachment(removable):
-    """Whether firmware says a human could have plugged this in.
+def attachment(removable, addr=None):
+    """Whether the port this sits on is user-accessible, and WHO says so.
 
-    `fixed` means the port is not user-accessible -- a soldered webcam or bluetooth
-    module. `removable` means it is. `unknown` is what you get for anything behind a
-    hub, because firmware only describes the ports on the machine itself.
+    `fixed` means not user-accessible -- a soldered webcam or bluetooth module.
+    `removable` means it is. Useful for triage in the plainest way: it separates what
+    was already inside the machine from what somebody attached to it.
 
-    Useful for triage in the plainest way: it separates what was already inside the
-    machine from what somebody attached to it.
+    But only when the parent is a ROOT hub. This function used to assume anything
+    behind a hub reported `unknown`, "because firmware only describes the ports on the
+    machine itself". That is false, and a keyboard on a GenesysLogic hub disproved it on
+    2026-08-23:
+
+        1-4.4  removable=fixed   parent=1-4      -> "internal, soldered to this machine"
+
+    A hub supplies this for its own ports, from the DeviceRemovable bitmap in its hub
+    descriptor. So the tool was taking a HUB's self-assertion and rendering it as a
+    statement about the machine's construction, which is a trust signal. A hostile hub
+    sets that bit and everything plugged into it reads as built-in hardware.
+
+    Everything a USB device reports is self-asserted, including this. Say whose claim it
+    is. `addr` is the DEVICE's own address; the parent is derived from it here so no
+    caller can get the relationship the wrong way round. Pass none to get the old
+    unqualified wording.
     """
     v = (removable or "").strip().lower()
-    return {"fixed": "internal, soldered to this machine",
-            "removable": "user-accessible port"}.get(v)
+    if v not in ("fixed", "removable"):
+        return None
+    parent = parent_of(addr) if addr else None
+    if parent is None or str(parent).startswith("usb"):     # root hub: ACPI describes it
+        return {"fixed": "internal, soldered to this machine",
+                "removable": "user-accessible port"}[v]
+    return {"fixed": "the parent hub calls this port non-removable -- that hub's claim, "
+                     "not the machine's",
+            "removable": "user-accessible port on an external hub"}[v]
 
 
 def link_note(usb_version, speed):
@@ -323,6 +344,20 @@ def addr_of(d):
     return os.path.basename((d or "").rstrip("/")) or None
 
 
+def id_of(d):
+    """vid:pid for a sysfs device dir, or None.
+
+    The allow list is matched on this, so anything WRITING to that list has to speak the
+    same language. --authorize used to store the operator's raw argument, which meant an
+    address went in whenever one was typed and matched nothing forever after.
+    """
+    d = (d or "")
+    if d and not d.endswith(os.sep):
+        d += os.sep
+    v, pr = _attr(d, "idVendor"), _attr(d, "idProduct")
+    return "%s:%s" % (v, pr) if v and pr else None
+
+
 def parent_of(addr):
     """The address of the hub a device hangs off, or None for a root hub.
 
@@ -370,8 +405,8 @@ def sort_key(addr):
     return (_int(bus) or 0, 1) + tuple(_int(x) or 0 for x in ports.split("."))
 
 
-def blinds_downstream(addr, authorized, is_hub):
-    """Is this an unauthorized HUB, i.e. one that is hiding whatever is behind it.
+def blinds_downstream(addr, authorized, is_hub, driver=None):
+    """Is this a HUB with no driver, i.e. one that is hiding whatever is behind it.
 
     This replaces a stranded_by() that walked UP from a device to find a shut hub
     above it. Proven unreachable on real hardware 2026-08-22: a withheld hub binds no
@@ -383,8 +418,32 @@ def blinds_downstream(addr, authorized, is_hub):
     "you cannot see what is behind this" rather than "these are unreachable" -- the
     tool genuinely does not know what is back there. That is the whole point: an
     unauthorized hub is an opaque surface, and a hostile device can present as one.
+
+    The test is the DRIVER, not the device gate, and that distinction is the whole
+    correctness of this function. It first checked `authorized == "0"`, which only ever
+    fires under withhold_device. The default protection is withhold_interface, which
+    leaves the device authorized and shuts the interface instead -- so a hub held by the
+    DEFAULT configuration was exactly as opaque and said nothing at all.
+
+    Proven on hardware 2026-08-23 with a VIA Labs dual-personality hub:
+
+        1-4  device authorized=1   iface 1-4:1.0 authorized=0   driver: none
+        kernel: hub 1-4:1.0: Interface 0 is not authorized for usage
+
+    Nothing behind it can enumerate, because no hub driver is bound. Whether the gate
+    that stopped the bind was the device one or the interface one does not matter to
+    anything downstream, so it must not matter here either.
+
+    Passing driver=None keeps the old device-gate-only behaviour, for callers that have
+    no driver information to give.
     """
-    return bool(is_hub) and authorized.get(addr) == "0" and not str(addr).startswith("usb")
+    if not is_hub or str(addr).startswith("usb"):
+        return False
+    if authorized.get(addr) == "0":
+        return True
+    if driver is None:                      # caller cannot tell us; do not guess
+        return False
+    return str(driver).strip().lower() in ("", "-", "none")
 
 
 def stranded_by(addr, authorized):

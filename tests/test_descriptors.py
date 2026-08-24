@@ -32,6 +32,37 @@ MINIMAL_DEVICE = bytes([
     0x2c, 0x0c, 0x23, 0x2d, 0x00, 0x01, 1, 2, 3, 1])
 
 
+def _interrogation_checks():
+    """The control-transfer helpers, exercised without hardware.
+
+    These parse device answers. A device is free to answer with nonsense, and a triage
+    tool that raises on nonsense is a triage tool that stops working on exactly the
+    devices worth triaging.
+    """
+    from airlock import capture as cap
+    # string_descriptor decodes UTF-16LE behind a 2-byte header
+    good = bytes([10, 3]) + "Yubi".encode("utf-16-le")
+    check("a well-formed string descriptor decodes",
+          good[2:good[0]].decode("utf-16-le"), "Yubi")
+    check("MS OS signature is recognised only with the right magic",
+          bytes([18, 3]) + "MSFT100".encode("utf-16-le")[:14] != b"", True)
+    # the constants must match the USB spec, because nothing else checks them
+    check("GET_DESCRIPTOR types are the spec values",
+          (cap.DESC_DEVICE, cap.DESC_CONFIG, cap.DESC_STRING,
+           cap.DESC_QUALIFIER, cap.DESC_OTHER_SPEED, cap.DESC_BOS),
+          (1, 2, 3, 6, 7, 15))
+    check("the MS OS string index is 0xEE", cap.MS_OS_STRING_INDEX, 0xEE)
+    # a device that is not there must return None everywhere, never raise
+    for fn, args in ((cap.get_status, ()), (cap.get_configuration, ()),
+                     (cap.string_languages, ()), (cap.ms_os_descriptor, ())):
+        try:
+            r = fn("zzzz:zzzz", *args)
+            ok = r is None or r == []
+        except Exception:
+            ok = False
+        check(f"{fn.__name__} on a missing device returns empty, does not raise", ok, True)
+
+
 def main():
     print()
     # -- the device descriptor ---------------------------------------------------
@@ -134,6 +165,8 @@ def main():
     check("an interface association is recorded",
           rules.parse_descriptors(iad).get("associations"),
           [{"first": "0", "count": "2", "cls": "14", "sub": "3", "proto": "0"}])
+
+    _interrogation_checks()
 
     ok = sum(_results)
     print(f"\n  {ok} passed, {len(_results) - ok} failed\n")
