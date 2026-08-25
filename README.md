@@ -335,6 +335,45 @@ The section that matters is **disagreements**. A descriptor is a claim written o
 factory. `GET_STATUS` is the device answering about itself in the present tense. Where the
 two differ is where a device is worth a second look.
 
+### Strings nothing points at
+
+A device descriptor carries three string pointers: `iManufacturer`, `iProduct`,
+`iSerialNumber`. Configurations and interfaces carry one each. Every tool fetches those.
+A device can hold strings at indices nothing references, and nothing ever asks for them.
+
+`--interrogate` probes 1-16 and prints whatever answers. Real examples from one laptop:
+
+An Intel bluetooth module whose device descriptor declares **no strings at all** -- all
+three indices are zero, which is why every listing shows it as `(no product string)` --
+and which is nonetheless carrying:
+
+```
+[1]  Intel(R) Corporation
+[3]  001122334455 WP_A0        <- a placeholder MAC and a firmware tag
+```
+
+Caveat worth stating: strings referenced only by CLASS-SPECIFIC descriptors are not
+"unreferenced", they are referenced by something this tool does not parse. A UVC webcam's
+terminal and selector units point at strings, `lsusb -v` follows them, and this does not.
+`referenced_strings()` reads the standard descriptors only and the wording says so.
+
+### Firmware that does not bounds-check
+
+USB 2.0 section 9.4.3: a `GET_DESCRIPTOR` for something that does not exist is a request
+error, and the device must **stall**. Probing found a GenesysLogic hub that does not:
+
+```
+index 3    "7411A01"        a part revision nothing points at
+index 42   "USB2.0 Hub"
+index 254  "USB2.0 Hub"
+```
+
+Two other external devices on the same bus stalled correctly, so it is the hub rather than
+the host. Reported as `[LOW] answers string indices it cannot have`.
+
+The finding is not the leaked string. It is the missing validation: firmware that does not
+bounds-check one field of one request is unlikely to bounds-check others.
+
 ### Reading the Microsoft OS descriptor line
 
 Windows asks every device for these on first enumeration, so most mass-market hardware

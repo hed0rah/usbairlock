@@ -318,6 +318,35 @@ USAGE_PAGES = {
 # non-standard missed 0xF1D0 entirely -- a YubiKey's 64-byte bidirectional FIDO pipe was
 # not flagged as a channel at all on 2026-08-23, and an attacker can pick any of the
 # thousands of unassigned pages below 0xFF00 to get the same silence.
+def referenced_strings(blob):
+    """Every string index any STANDARD descriptor in a config blob points at.
+
+    Device descriptors carry iManufacturer/iProduct/iSerialNumber, configurations carry
+    iConfiguration, interfaces carry iInterface. Those are the ones whose position is
+    fixed by the spec and can be read without knowing the class.
+
+    Class-specific descriptors carry string indices too -- UVC terminal and selector
+    units are the common case -- and their layout depends entirely on the class, so this
+    cannot see them. That is why the caller must say "not referenced by any STANDARD
+    descriptor" rather than "unreferenced": a webcam's strings looked unreferenced here
+    and appear in lsusb -v, because lsusb parses UVC and this does not.
+    """
+    out, i = set(), 0
+    while i + 1 < len(blob):
+        ln, typ = blob[i], blob[i + 1]
+        if ln < 2:
+            break
+        d = blob[i:i + ln]
+        if typ == 1 and ln >= 17:                 # DEVICE
+            out |= {d[14], d[15], d[16]}
+        elif typ == 2 and ln >= 7:                # CONFIGURATION
+            out.add(d[6])
+        elif typ == 4 and ln >= 9:                # INTERFACE
+            out.add(d[8])
+        i += ln
+    return {x for x in out if x}
+
+
 def nonstandard_page(page):
     # Being NAMEABLE is not the same as being standard. Adding 0xF1D0 to the table above
     # so it prints nicely immediately made this return False for it, which would have

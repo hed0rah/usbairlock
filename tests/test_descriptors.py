@@ -52,6 +52,12 @@ def _interrogation_checks():
            cap.DESC_QUALIFIER, cap.DESC_OTHER_SPEED, cap.DESC_BOS),
           (1, 2, 3, 6, 7, 15))
     check("the MS OS string index is 0xEE", cap.MS_OS_STRING_INDEX, 0xEE)
+    # USB 2.0 9.4.3: a descriptor that does not exist is a request error and the device
+    # must stall. A GenesysLogic hub answered index 254 with the same string as index 4;
+    # two other devices on the same bus stalled, so it is the firmware, not the host.
+    # A device that cannot be asked at all must not be reported as non-compliant.
+    check("a device that cannot be reached is unknown, not guilty",
+          cap.string_index_is_bounded("zzzz:zzzz"), True)
     # a device that is not there must return None everywhere, never raise
     for fn, args in ((cap.get_status, ()), (cap.get_configuration, ()),
                      (cap.string_languages, ()), (cap.ms_os_descriptor, ())):

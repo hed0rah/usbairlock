@@ -39,8 +39,10 @@ the same kernel settings. From any other terminal:
     sudo ./usbairlock --authorize DEVICE  admit a device, and tell the monitor to trust it
     sudo ./usbairlock --forget           clear the allow list (it persists in /run)
 
-Every protection is reversible and is restored when this exits, including on Ctrl-C
-or a kill.
+Every protection is LIFTED when this exits, including on Ctrl-C or a kill: the kernel
+settings go back exactly as they were and anything held is switched on again. Nothing
+survives the process. For protections that outlive it, use --arm, and --disarm to end
+them.
 """
 import argparse, glob, json, os, queue, re, signal, sys, threading, time
 
@@ -697,7 +699,15 @@ def do_interrogate(spec, porc=False):
     if ms is None and usbinfo.rules.to_int(attr("idVendor") or "0") in KNOWN_BIG_VENDORS:
         notes.append(("MED", "mass-market vendor id, no MS OS descriptors",
                       "weak on its own; weigh with the rest"))
-    if len(found) > 3:
+    bounded = capmod.string_index_is_bounded(addr)
+    if bounded is False:
+        notes.append(("LOW", "answers string indices it cannot have",
+                      "USB 2.0 9.4.3 requires a stall; firmware is not "
+                      "bounds-checking the request"))
+    # Only meaningful for a device that actually bounds-checks. One that answers every
+    # index answers sixteen of them by definition, and reporting that as a second finding
+    # says the same thing twice.
+    if len(found) > 3 and bounded is not False:
         notes.append(("LOW", f"{len(found)} string descriptors answer, device "
                              f"descriptor references 3",
                       "not suspicious; just unread elsewhere"))
@@ -1392,7 +1402,7 @@ def main():
                 f"{C['R']}high {counts['high']}{C['N']}  {C['Y']}med {counts['med']}{C['N']}"
                 f"   serial {len(prev_serial)}   up {int(time.time()-started)}s{watching}",
                 f" {C['D']}{last[:72]}{C['N']}",
-                f" {C['D']}ctrl-c stops and restores every kernel change{C['N']}",
+                f" {C['D']}ctrl-c lifts every protection and puts the kernel back{C['N']}",
             ]
             last_status[:] = lines
             if pin.enabled: pin.set(lines)

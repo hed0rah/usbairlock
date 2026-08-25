@@ -213,6 +213,33 @@ def string_languages(spec):
     return [b[i] | (b[i + 1] << 8) for i in range(2, min(b[0], len(b)) - 1, 2)]
 
 
+def string_index_is_bounded(spec, probe=(0xFE, 0x63, 0x2A)):
+    """Does the device STALL a string index it does not have? (True = compliant.)
+
+    USB 2.0 9.4.3: a GET_DESCRIPTOR for a descriptor that does not exist is a request
+    error, and the device must stall. Probing indices nothing references found a
+    GenesysLogic hub answering EVERY index with the same string:
+
+        index 3   -> "7411A01"        a part revision nothing points at
+        index 42  -> "USB2.0 Hub"
+        index 254 -> "USB2.0 Hub"
+
+    Two other external devices on the same bus stalled correctly, so it is the hub and
+    not the host. Firmware that does not bounds-check one field of one request is
+    unlikely to bounds-check others, which is the reason to report it: not the leaked
+    string, the missing validation.
+
+    Returns True (stalls, compliant), False (answers anything), or None (could not ask).
+    """
+    answers = []
+    for idx in probe:
+        v = string_descriptor(spec, idx)
+        if v is None:
+            return True                      # one stall is enough to show it checks
+        answers.append(v)
+    return False if answers else None
+
+
 MS_OS_STRING_INDEX = 0xEE
 
 
