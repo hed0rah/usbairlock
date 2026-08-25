@@ -492,9 +492,8 @@ def capability_threats(parsed):
     if back:
         out.append(("MED", "that channel is bidirectional (%s)" %
                     ", ".join(page_name(p) for p in back),
-                    "it declares reports the HOST sends to IT, on a page with no "
-                    "standard meaning. Legitimate for a security key; also the shape "
-                    "of a command channel"))
+                    "declares host-to-device reports on a page with no standard "
+                    "meaning"))
     return out
 
 

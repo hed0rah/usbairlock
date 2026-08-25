@@ -319,6 +319,54 @@ version is doing so on purpose -- a Bluetooth adapter declaring USB 2.01 and run
 12 Mb/s has no use for High Speed. Flagging that would bury the one case that means
 something.
 
+## --interrogate: make it answer for itself
+
+The gate shuts *interfaces*. Endpoint 0 belongs to the **device**, so the standard
+control-request surface stays open on something no driver can touch: full declared
+capability, zero ability to act.
+
+Enumeration reads the device and configuration descriptors and asks for nothing else ever
+again. `--interrogate` asks for the rest -- every string index rather than the three a
+descriptor references, `device_qualifier` and `other_speed_config` (what it would be at
+its other speed), `BOS`, `GET_STATUS`, `GET_CONFIGURATION`, Microsoft OS descriptors, and
+every configuration rather than only the active one.
+
+The section that matters is **disagreements**. A descriptor is a claim written once at the
+factory. `GET_STATUS` is the device answering about itself in the present tense. Where the
+two differ is where a device is worth a second look.
+
+### Reading the Microsoft OS descriptor line
+
+Windows asks every device for these on first enumeration, so most mass-market hardware
+implements them and most hand-built firmware does not. On its own that is weak evidence:
+a HID device needs no compat id, and plenty of legitimate cheap hardware skips them
+entirely. It only carries weight when the device is claiming to **be** something
+mass-market.
+
+Which is exactly the case it was built for. A Flipper Zero running BadUSB and presenting
+as `146d:c529`:
+
+```
+microsoft OS descriptors
+    absent   no MSFT100 signature at string 0xEE
+
+disagreements
+    [MED] bmAttributes says self-powered, GET_STATUS says bus-powered
+           descriptor claim vs live state
+```
+
+A genuine YubiKey on the same bus, same moment:
+
+```
+microsoft OS descriptors
+    present  vendor request code 0x27
+
+no contradictions
+```
+
+Neither line is a verdict. Together with the class claims and the report descriptor, they
+are weight.
+
 ## --describe: every byte, decoded
 
 ```sh
@@ -761,7 +809,7 @@ tables. Everything Linux-specific lives elsewhere.
 | `sudo ./usbairlock --describe ADDR` | every descriptor of one device, decoded, with a byte count |
 | `sudo ./usbairlock --hid ADDR` | dump the HID report descriptors: what the device declares it can send |
 | `sudo ./usbairlock --arm` / `--disarm` | apply or release protections and exit, persistently |
-| `sudo ./usbairlock --authorize VID:PID` | admit one device, and share that decision with a running monitor |
+| `sudo ./usbairlock --authorize DEVICE` | admit one device, and share that decision with a running monitor |
 | `sudo ./usbairlock --attach` | read-only view of a monitor already running elsewhere |
 | `sudo ./usbairlock --forget` | clear the allow list, which otherwise persists in `/run` until reboot |
 | `./usbairlock --write-config` | print a config file |

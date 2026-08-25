@@ -252,8 +252,7 @@ def attachment(removable, addr=None):
     if parent is None or str(parent).startswith("usb"):     # root hub: ACPI describes it
         return {"fixed": "internal, soldered to this machine",
                 "removable": "user-accessible port"}[v]
-    return {"fixed": "the parent hub calls this port non-removable -- that hub's claim, "
-                     "not the machine's",
+    return {"fixed": "non-removable per the parent hub (its claim, not the machine's)",
             "removable": "user-accessible port on an external hub"}[v]
 
 

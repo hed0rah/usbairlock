@@ -274,7 +274,7 @@ def main():
     check("a root-hub port is the machine's own claim, and stays plain",
           "soldered" in (ui.attachment("fixed", "1-14") or ""), True)
     check("the same bit behind an external hub is attributed to that hub",
-          "hub's claim" in (ui.attachment("fixed", "1-4.4") or ""), True)
+          "its claim" in (ui.attachment("fixed", "1-4.4") or ""), True)
     check("and never says soldered",
           "soldered" in (ui.attachment("fixed", "1-4.4") or ""), False)
     check("removable behind an external hub says where it is",

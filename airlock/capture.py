@@ -604,10 +604,8 @@ def capture(vid_pid, interface=0, endpoint=0x81, on_event=None, on_lost=None, se
                 # wide, so the ceiling is platform-dependent. Unreachable for a normal
                 # device and entirely reachable for a hostile descriptor, which is
                 # exactly the case this tool exists for.
-                errno.EINVAL: "EINVAL: interface number is too high for usbfs to "
-                              "track. The claim set is a bitmask one unsigned long wide, "
-                              "so the ceiling is 64 interfaces on a 64-bit box and 32 on "
-                              "a 32-bit one. Such a device cannot be claimed at all",
+                errno.EINVAL: "EINVAL: interface number above the usbfs ceiling "
+                              "(8*sizeof(long) interfaces). Not claimable",
             }.get(e.errno, str(e))
             raise RuntimeError(f"cannot claim interface {interface}: {why}") from e
         # Ask for what the endpoint can actually send, not what a boot report weighs.

@@ -104,7 +104,13 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None, quiet=0):
     hubtag = f" {C['B']}[HUB]{C['N']}" if d.get("is_hub") else ""
     addr = usbinfo.addr_of(meta.get("sysfs")) if meta else d.get("addr")
     at = f"{C['C']}{addr}{C['N']}  " if addr else ""
-    p(f"  {time.strftime('%H:%M:%S')}  {tag}  {at}{C['W']}{vp}{C['N']}{hubtag}  {name or C['D']+'(no product string)'+C['N']}")
+    # The monitor is the view people actually watch, and it showed no parentage at all --
+    # a device two hubs deep read exactly like one in a socket. The address encodes the
+    # tree, but only for a reader who already knows that.
+    lin = usbinfo.lineage(addr or "")
+    p(f"  {time.strftime('%H:%M:%S')}  {tag}  {at}{C['W']}{vp}{C['N']}{hubtag}  "
+      f"{name or C['D']+'(no product string)'+C['N']}"
+      + (f"   {C['D']}{lin}{C['N']}" if lin else ""))
     if d.get("authorized") == "0":
         p(f"                 {C['Y']}UNAUTHORIZED{C['N']}  {C['D']}no interface objects, so nothing can bind or be claimed.{C['N']}")
         p(f"                               {C['D']}descriptors below are still readable over control transfers{C['N']}")
@@ -169,8 +175,7 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None, quiet=0):
         if quiet >= 1 and alts:
             # Say what was dropped. A listing that silently omits things is how a tool
             # ends up describing a device as simpler than it is.
-            p(f"                 {C['D']}+ {len(alts)} alternate setting(s) hidden, "
-              f"drop -q to show them{C['N']}")
+            p(f"                 {C['D']}+ {len(alts)} alt setting(s) hidden{C['N']}")
 
     th = usbinfo.threats(d)
     if th:
@@ -624,8 +629,7 @@ def do_interrogate(spec, porc=False):
         if v:
             found.append((i, v))
     if found:
-        p(f"\n  {C['C']}string descriptors{C['N']}  {C['D']}every index that answers, not "
-           f"only the ones a descriptor references{C['N']}")
+        p(f"\n  {C['C']}string descriptors{C['N']}  {C['D']}indices 1-16, probed{C['N']}")
         referenced = {attr('manufacturer'), attr('product'), attr('serial')} - {None}
         for i, v in found:
             tag = "" if v in referenced else f"   {C['Y']}unreferenced{C['N']}"
@@ -649,18 +653,14 @@ def do_interrogate(spec, porc=False):
     ms = capmod.ms_os_descriptor(addr)
     p(f"\n  {C['C']}microsoft OS descriptors{C['N']}")
     if ms is None:
-        p(f"      {C['D']}absent. Windows asks every device for these on first "
-           f"enumeration, so most mass-market hardware implements them and most "
-           f"hand-built firmware does not. Weak evidence on its own -- a HID device "
-           f"needs no compat id -- but telling when the device claims to BE something "
-           f"mass-market.{C['N']}")
+        p(f"      absent   {C['D']}no MSFT100 signature at string 0xEE{C['N']}")
     else:
         code, compat = ms
-        p(f"      present, vendor request code 0x{code:02x}")
+        p(f"      present  {C['D']}vendor request code 0x{code:02x}{C['N']}")
         for cid, sub_ in compat:
             p(f"      compat id  {cid or '-'} / {sub_ or '-'}")
         if not compat:
-            p(f"      {C['D']}signature present, no compat ids returned{C['N']}")
+            p(f"      {C['D']}no compat ids returned{C['N']}")
 
     # ---- every configuration, not just the live one ------------------------------
     ncfg = usbinfo.rules.to_int(attr("bNumConfigurations") or "1") or 1
@@ -681,23 +681,19 @@ def do_interrogate(spec, porc=False):
         pc = usbinfo.power_claim(attr("bmAttributes")) or {}
         claimed_self = bool(pc.get("self_powered"))
         if claimed_self and not (status & 1):
-            notes.append(("MED", "descriptor claims self-powered, the device reports "
-                                 "bus-powered right now",
-                          "bmAttributes is a factory claim; GET_STATUS is the device "
-                          "answering about itself. Drawing from the bus while declaring "
-                          "otherwise misstates what it costs the host"))
+            notes.append(("MED", "bmAttributes says self-powered, GET_STATUS says "
+                                 "bus-powered",
+                          "descriptor claim vs live state"))
         if (status & 2):
-            notes.append(("MED", "remote wakeup is ARMED, not merely supported",
-                          "this device can bring the machine out of suspend"))
+            notes.append(("MED", "remote wakeup armed",
+                          "can resume the machine from suspend"))
     if ms is None and usbinfo.rules.to_int(attr("idVendor") or "0") in KNOWN_BIG_VENDORS:
-        notes.append(("MED", "claims a mass-market vendor id but has no MS OS descriptors",
-                      "not conclusive, and cheap legitimate hardware skips them too. "
-                      "Worth weighing with everything else"))
+        notes.append(("MED", "mass-market vendor id, no MS OS descriptors",
+                      "weak on its own; weigh with the rest"))
     if len(found) > 3:
-        notes.append(("LOW", f"{len(found)} string descriptors answer, more than the "
-                             f"three a device descriptor references",
-                      "extra strings are not suspicious by themselves; they are simply "
-                      "content nothing else displays"))
+        notes.append(("LOW", f"{len(found)} string descriptors answer, device "
+                             f"descriptor references 3",
+                      "not suspicious; just unread elsewhere"))
     if notes:
         p(f"\n  {C['C']}disagreements{C['N']}")
         for lvl, head, why in notes:
@@ -705,7 +701,7 @@ def do_interrogate(spec, porc=False):
             p(f"      {col}[{lvl}]{C['N']} {head}")
             p(f"             {C['D']}{why}{C['N']}")
     else:
-        p(f"\n  {C['D']}nothing it said contradicts anything else it said{C['N']}")
+        p(f"\n  {C['D']}no contradictions{C['N']}")
     p("")
     return 0
 
