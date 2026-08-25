@@ -382,7 +382,7 @@ def prepare(vid_pid, interface=0):
             open(AUTOPROBE, "w").write("0")
             if _protect_mod: _protect_mod.add_cleanup(_autoprobe_restore)
             undo.append(_autoprobe_restore)
-            steps.append("driver auto-binding suspended while this interface is opened")
+            steps.append("driver auto-binding suspended")
         except Exception:
             _autoprobe_prev = None
 
@@ -392,9 +392,8 @@ def prepare(vid_pid, interface=0):
             # withhold_device has to be lifted FOR THIS DEVICE to read anything at all.
             # That is a real reduction in protection and the operator should see it
             # happen rather than discover it later.
-            steps.append("NOTE device gate lifted for this device only: a withheld "
-                         "device exposes no interfaces at all, so there is nothing to "
-                         "read. NO driver is bound; the driver gate stays shut")
+            steps.append("device gate lifted for this device only, driver gate "
+                         "still shut")
             time.sleep(0.4)
 
     for i in sorted(glob.glob(dev+"*:*")):
@@ -407,8 +406,7 @@ def prepare(vid_pid, interface=0):
             # looked exactly like the gate had failed. It had not: usbhid was already
             # detached, so nothing could bind, and usbfs claims it a moment later.
             if _w(a, 1):
-                steps.append(f"{os.path.basename(i)} made claimable (no driver can bind, "
-                             f"usbhid is detached)")
+                steps.append(f"{os.path.basename(i)} claimable, usbhid detached")
     # With autoprobe off nothing can have bound in the step above. This loop is for a
     # device that was ALREADY bound when we got here -- the common case for something
     # plugged in before the monitor started.

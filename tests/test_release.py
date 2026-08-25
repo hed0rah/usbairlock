@@ -104,8 +104,11 @@ def main():
         # three meanings and read like the gate had failed. Do not reuse the word.
         check("without reusing the word 'authorized' for it",
               any("authorized 1-1:1.0" in s_ for s_ in steps), False)
+        # The wording has been shortened once already; what must survive is the
+        # PROMISE, not the sentence. Lifting the device gate for one device has to be
+        # reported alongside the fact that the driver gate did not move.
         check("and it says the driver gate is still shut",
-              any("driver gate stays shut" in s_ or "no driver can bind" in s_
+              any("driver gate still shut" in s_ or "usbhid detached" in s_
                   for s_ in steps), True)
 
         for f in ("authorized", os.path.join("1-1:1.0", "authorized")):

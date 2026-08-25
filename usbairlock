@@ -112,16 +112,23 @@ def show_device(vp, name, cfg, first_seen=False, meta=None, out=None, quiet=0):
       f"{name or C['D']+'(no product string)'+C['N']}"
       + (f"   {C['D']}{lin}{C['N']}" if lin else ""))
     if d.get("authorized") == "0":
-        p(f"                 {C['Y']}UNAUTHORIZED{C['N']}  {C['D']}no interface objects, so nothing can bind or be claimed.{C['N']}")
-        p(f"                               {C['D']}descriptors below are still readable over control transfers{C['N']}")
+        p(f"                 {C['Y']}UNAUTHORIZED{C['N']}  {C['D']}no interface objects; "
+          f"descriptors still readable over ep0{C['N']}")
     if known: p(f"                 {C['C']}known:{C['N']} {known}")
 
     mode = cfg["monitor"].get("descriptors", "summary")
     if mode != "none":
         bits = []
-        for k, lab in (("usb_version","usb"), ("speed","speed"), ("max_power","power"),
-                       ("n_configs","configs"), ("authorized","authorized")):
+        for k, lab in (("usb_version","usb"), ("speed","speed"), ("max_power","power")):
             if d.get(k): bits.append(f"{lab}={d[k]}")
+        # Print what DIFFERS from the ordinary case. One configuration and an authorized
+        # device are the overwhelming default, and saying so on every line cost about a
+        # quarter of the row's width to tell the reader nothing. Both are worth shouting
+        # about when they are NOT the default, and that is when they now appear.
+        if str(d.get("n_configs") or "1") != "1":
+            bits.append(f"{C['Y']}configs={d['n_configs']}{C['N']}")
+        if str(d.get("authorized") or "1") != "1":
+            bits.append(f"{C['Y']}authorized=0{C['N']}")
         # What the device claims about its own power. A hub asserting self-powered
         # while it has no supply is why the things behind it fail with nothing logged.
         pw = usbinfo.power_claim(d.get("cfg_attrs"))
