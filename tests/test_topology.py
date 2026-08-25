@@ -122,6 +122,20 @@ def main():
           isinstance(usbinfo.sort_key("1-x.y"), tuple), True)
     check("an empty address sorts without raising", usbinfo.sort_key(""), ())
 
+    # -- lineage: a breadcrumb, not indentation --------------------------------------
+    # --list indents because each device is one row. --inspect and --describe emit
+    # multi-line blocks, and indenting a block by depth is unreadable at depth three, so
+    # they get one line saying where the device sits instead.
+    check("a device straight off a root hub has no lineage",
+          usbinfo.lineage("1-2"), None)
+    check("a root hub has none either", usbinfo.lineage("usb1"), None)
+    check("one hub deep names it", usbinfo.lineage("1-4.4"), "behind 1-4")
+    check("two deep names the chain, outermost first",
+          usbinfo.lineage("1-4.4.1"), "behind 1-4 -> 1-4.4")
+    check("a malformed address does not loop forever",
+          isinstance(usbinfo.lineage("1-x.y.z") or "", str), True)
+    check("an empty address is not a lineage", usbinfo.lineage(""), None)
+
     ok = sum(_results)
     print(f"\n  {ok} passed, {len(_results) - ok} failed\n")
     return 0 if ok == len(_results) else 1

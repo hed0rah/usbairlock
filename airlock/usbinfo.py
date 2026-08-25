@@ -359,6 +359,31 @@ def is_internal(removable, addr=None):
     return bool(parent) and str(parent).startswith("usb")
 
 
+def lineage(addr):
+    """Human breadcrumb for where a device sits: 'behind 1-4 -> 1-4.4', or None.
+
+    A BREADCRUMB rather than indentation, deliberately. --list can indent because each
+    device is one row; --inspect and --describe emit multi-line blocks, and indenting a
+    whole block by depth becomes unreadable at depth three while stealing width from
+    descriptor lines that are already long. One line at the top says the same thing and
+    costs nothing at any depth.
+
+    The address already encodes the tree -- 1-4.4.1 is port 1 of the hub on port 4 of the
+    hub on port 4 -- but only to someone who knows that. Spelling it out is the difference
+    between a reader seeing a hub chain and a reader seeing a long number.
+    """
+    chain, cur = [], parent_of(addr)
+    while cur and not str(cur).startswith("usb"):
+        chain.append(cur)
+        nxt = parent_of(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    if not chain:
+        return None
+    return "behind " + " -> ".join(reversed(chain))
+
+
 def id_of(d):
     """vid:pid for a sysfs device dir, or None.
 

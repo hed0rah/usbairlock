@@ -284,6 +284,8 @@ def do_inspect(cfg, target=None, porc=False, quiet=0):
         if target: p(f"  {C['D']}./usbairlock --list shows every address{C['N']}")
         return 1
     worst = 0
+    hits = sorted(hits, key=lambda m: usbinfo.sort_key(
+        usbinfo.addr_of(m.get("sysfs")) or ""))
     for m in hits:
         if porc:
             d = usbinfo.descriptors(m["id"])
@@ -482,8 +484,10 @@ def do_describe(spec):
     dev = usbinfo.descriptors(spec)
     addr = usbinfo.addr_of(d)
     p()
+    _lin = usbinfo.lineage(addr)
     p(f"  {C['W']}{addr}{C['N']}  {C['W']}{x.get('id','?')}{C['N']}  "
-      f"{C['D']}{dev.get('product') or '(no product string)'}{C['N']}")
+      f"{C['D']}{dev.get('product') or '(no product string)'}{C['N']}"
+      + (f"   {C['D']}{_lin}{C['N']}" if _lin else ""))
     rule()
 
     # ---- device -----------------------------------------------------------------
@@ -594,7 +598,9 @@ def do_interrogate(spec, porc=False):
         try: return open(os.path.join(dev, name)).read().strip()
         except Exception: return None
 
-    p(f"\n  {C['W']}{addr}{C['N']}  {vp}  {attr('product') or '(no product string)'}")
+    _lin = usbinfo.lineage(addr)
+    p(f"\n  {C['W']}{addr}{C['N']}  {vp}  {attr('product') or '(no product string)'}"
+      + (f"   {C['D']}{_lin}{C['N']}" if _lin else ""))
     rule()
 
     # ---- what the DEVICE says when asked, right now ------------------------------
@@ -732,7 +738,9 @@ def do_hid(spec, porc=False):
     addr = usbinfo.addr_of(d)
     hits = 0
     if not porc:
-        p(); p(f"  {C['W']}{addr}{C['N']}  {C['D']}HID report descriptors{C['N']}"); rule()
+        _lin = usbinfo.lineage(addr)
+        p(); p(f"  {C['W']}{addr}{C['N']}  {C['D']}HID report descriptors{C['N']}"
+              + (f"   {C['D']}{_lin}{C['N']}" if _lin else "")); rule()
     for i in sorted(glob.glob(os.path.join(d, "*:*"))):
         if usbinfo._attr(i, "bInterfaceClass") != "03":
             continue
@@ -1022,7 +1030,7 @@ def do_list(a):
         auth = f"{C['G']}1{C['N']}" if r["auth"] == "1" else f"{C['R']}0{C['N']}"
         tag = f"{C['B']}[HUB]{C['N']} " if r["hub"] == "1" else ""
         d0 = int(r["depth"])
-        indent = "" if d0 == 0 else ("  " * (d0 - 1)) + "\u2514 "
+        indent = "" if (d0 == 0 or a.quiet >= 2) else ("  " * (d0 - 1)) + "\u2514 "
         shown = (indent + r["addr"])[:14]
         p(f"  {shown:<14s} {r['bus']}/{r['devnum']}   {C['W']}{r['id']}{C['N']}    "
           f"{r['iclass']:<7s} {r['driver']:<11s} {auth}     {tag}{r['name'][:30]}")
