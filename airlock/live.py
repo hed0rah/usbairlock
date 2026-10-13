@@ -16,7 +16,7 @@ session and just refuses to let the status scroll away.
 Anything that changes terminal state MUST register a restore on the same path the signal
 handler uses, or Ctrl-C leaves the user with a wedged terminal. See protect.add_cleanup.
 """
-import os, shutil, sys
+import os, select, shutil, signal, sys, time
 
 class Pinned:
     def __init__(self, height=6, enabled=True):
@@ -103,3 +103,96 @@ class Pinned:
         out.append("\0338")                            # restore cursor
         sys.stdout.write("".join(out))
         sys.stdout.flush()
+
+
+class Keys:
+    """Single keystrokes from the terminal, read between poll ticks.
+
+    Replaces the monitor's sleep with a select on stdin, so a key arrives at once and an
+    idle tick still waits the full interval. No thread, no line editor: one character
+    per action, which is the shape the pinned block already has room to explain.
+
+    cbreak, not raw. ICANON and ECHO go off so a key is delivered as it is pressed and
+    not shown; ISIG stays on so ctrl-c is still a signal and still reaches the handler
+    that lifts the protections. Restoring the terminal is registered on that handler's
+    path (protect.add_cleanup) for the same reason Pinned does it: os._exit skips
+    context managers, and a stuck cbreak terminal is exactly the sort of wedge this
+    tool is meant never to leave behind.
+
+    Off unless BOTH ends are a terminal and this process owns the foreground. Reading a
+    tty from a background job raises SIGTTIN, which stops the process, and a stopped
+    monitor is one that holds devices and answers nothing. SIGTTIN is ignored while keys
+    are on so a later ctrl-z / bg cannot do the same: the read then fails with EIO,
+    which reads as no key.
+    """
+    def __init__(self, off=None):
+        """`off` is a reason to leave keys disabled, shown to the operator in the status."""
+        self.fd = None
+        self._saved = None
+        self._prev_ttin = None
+        self.reason = None
+        self.enabled = False
+        if off:
+            self.reason = off
+        elif not (sys.stdin.isatty() and sys.stdout.isatty()):
+            self.reason = "not a terminal"
+        else:
+            self.enabled = True
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        import termios
+        try:
+            self.fd = sys.stdin.fileno()
+            if os.tcgetpgrp(self.fd) != os.getpgrp():
+                self.enabled, self.reason = False, "not in the foreground"
+                return self
+            self._saved = termios.tcgetattr(self.fd)
+            mode = list(self._saved)
+            mode[3] &= ~(termios.ICANON | termios.ECHO)
+            mode[6] = list(mode[6])
+            mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+            termios.tcsetattr(self.fd, termios.TCSANOW, mode)
+        except (termios.error, OSError, ValueError) as e:
+            self.enabled, self.reason, self._saved = False, str(e), None
+            return self
+        try:
+            self._prev_ttin = signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
+        try:
+            from . import protect
+            protect.add_cleanup(self.close)
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, *a): self.close()
+
+    def close(self):
+        if self._saved is None:
+            return
+        import termios
+        saved, self._saved = self._saved, None
+        try: termios.tcsetattr(self.fd, termios.TCSANOW, saved)
+        except (termios.error, OSError): pass
+        if self._prev_ttin is not None:
+            try: signal.signal(signal.SIGTTIN, self._prev_ttin)
+            except (OSError, ValueError): pass
+
+    def wait(self, timeout):
+        """Sleep up to `timeout`, returning early with whatever was typed, else ''."""
+        if not self.enabled:
+            time.sleep(timeout)
+            return ""
+        try:
+            r, _, _ = select.select([self.fd], [], [], timeout)
+        except (OSError, ValueError):
+            return ""
+        if not r:
+            return ""
+        try:
+            return os.read(self.fd, 64).decode("utf-8", "replace")
+        except OSError:
+            return ""

@@ -32,6 +32,11 @@ or a /dev/bus/usb node. A vid:pid names a MODEL and may match more than one.
                                             and where its claims disagree with its
                                             live state
 
+While the monitor runs, single keys act on the device it last showed, without a second
+terminal: `a` allows it (then `y` to confirm), `i` inspects it, `h` shows what it can
+send, `d` decodes every descriptor, `l` lists the devices a digit can pick, `?` helps.
+Off under --observe, because there a keyboard that arrives is live and could press them.
+
 One monitor runs at a time. A second one is refused rather than allowed to fight it over
 the same kernel settings. From any other terminal:
 
@@ -474,6 +479,81 @@ def _start_capture(vp, d, q, stop, target=None):
     t = threading.Thread(target=run, daemon=True)
     t.start()
     return t, mine, vp
+
+def _collect(fn, *args):
+    """Run a one-shot command and hand back its lines, to replay through emit.
+
+    The one-shot commands print through p() straight to stdout. Inside the monitor that
+    is the wrong place: it skips the viewers and the journal, and the bell that
+    show_device rings on HIGH would land mid-line in a log. Capturing and re-emitting
+    reuses the commands unchanged rather than threading an out= hook through each.
+
+    A command that raises must not take the monitor with it. A device unplugged between
+    the keypress and the sysfs read is the ordinary way that happens.
+    """
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try: fn(*args)
+        except Exception as e: print(f"  {C['R']}failed: {e}{C['N']}")
+    return buf.getvalue().replace("\a", "").splitlines()
+
+def do_authorize(spec):
+    """Admit one device now, and record it so a monitor keeps admitting it.
+
+    One path for --authorize and for the monitor's own `a` key. The flag was the only
+    caller, and the key would otherwise have been a second copy of it.
+    """
+    if not protect.is_root(): p(f"  {C['R']}--authorize needs root{C['N']}"); return 1
+    hits = usbinfo.resolve(spec)
+    if not hits:
+        p(f"  {C['R']}no device matching {spec}{C['N']}")
+        p(f"  {C['D']}./usbairlock --list shows every address{C['N']}")
+        return 1
+    if len(hits) > 1:
+        # vid:pid names a MODEL. Say so rather than acting on one and staying quiet.
+        p(f"  {C['Y']}{spec} matches {len(hits)} devices{C['N']} "
+          f"{C['D']}({', '.join(usbinfo.addr_of(h) for h in hits)}), authorizing all{C['N']}")
+        p(f"  {C['D']}address one of them instead to be specific{C['N']}")
+    done = []
+    for h in hits:
+        done += protect.authorize(path=h)
+    p(f"  authorized {len(done)} device(s): {' '.join(done) or 'none matched'}")
+    # Authorising writes sysfs, which a running monitor sees on its next poll.
+    # The ALLOW LIST is separate: it is policy, and without recording it there the
+    # monitor would withhold this same device again on the next replug.
+    #
+    # Record the vid:pid, NOT whatever the operator happened to type. The list was
+    # storing the raw argument, so `--authorize 1-4` wrote the ADDRESS while every
+    # match site tests vid:pid -- an entry nothing could ever match, under a message
+    # promising the device had been remembered. Found 2026-08-23 with a list reading
+    # "2109:2813 1-4.4 4-1 1-4 1-1", one real entry and four inert ones.
+    #
+    # Addresses would be the wrong key even if they were matched. A port is reusable:
+    # 1-1 was a hub earlier tonight and is a security key now. Trusting a PORT means
+    # authorising a hub and then inheriting that trust for whatever replaces it.
+    remember = sorted({usbinfo.id_of(h) for h in hits if usbinfo.id_of(h)})
+    if done and remember and ipc.append_allow(remember):
+        pid = ipc.holder_pid()
+        p(f"  {C['D']}remembered {' '.join(remember)}"
+          + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
+          + f"{C['N']}")
+    return 0 if done else 1
+
+def _target(m):
+    """The spec a key should act on, or None when that port no longer holds that device.
+
+    The pick list remembers addresses, and a port is reusable: the device it named may be
+    gone and something else plugged in where it was. Acting on the address alone would
+    allow the newcomer under the old device's name, which is the replug trap do_authorize
+    already refuses to key its allow list on.
+    """
+    if not m["addr"]:
+        return m["id"] or None
+    hits = usbinfo.resolve(m["addr"])
+    if len(hits) == 1 and usbinfo.id_of(hits[0]) == m["id"]:
+        return m["addr"]
+    return None
 
 def do_describe(spec):
     """Everything in a device's descriptors, decoded, with every byte accounted for.
@@ -1164,42 +1244,7 @@ def main():
     if a.observe:
         for k in cfg["protections"]: cfg["protections"][k] = False
 
-    if a.authorize:
-        if not protect.is_root(): p(f"  {C['R']}--authorize needs root{C['N']}"); return 1
-        hits = usbinfo.resolve(a.authorize)
-        if not hits:
-            p(f"  {C['R']}no device matching {a.authorize}{C['N']}")
-            p(f"  {C['D']}./usbairlock --list shows every address{C['N']}")
-            return 1
-        if len(hits) > 1:
-            # vid:pid names a MODEL. Say so rather than acting on one and staying quiet.
-            p(f"  {C['Y']}{a.authorize} matches {len(hits)} devices{C['N']} "
-              f"{C['D']}({', '.join(usbinfo.addr_of(h) for h in hits)}), authorizing all{C['N']}")
-            p(f"  {C['D']}address one of them instead to be specific{C['N']}")
-        done = []
-        for h in hits:
-            done += protect.authorize(path=h)
-        p(f"  authorized {len(done)} device(s): {' '.join(done) or 'none matched'}")
-        # Authorising writes sysfs, which a running monitor sees on its next poll.
-        # The ALLOW LIST is separate: it is policy, and without recording it there the
-        # monitor would withhold this same device again on the next replug.
-        #
-        # Record the vid:pid, NOT whatever the operator happened to type. The list was
-        # storing the raw argument, so `--authorize 1-4` wrote the ADDRESS while every
-        # match site tests vid:pid -- an entry nothing could ever match, under a message
-        # promising the device had been remembered. Found 2026-08-23 with a list reading
-        # "2109:2813 1-4.4 4-1 1-4 1-1", one real entry and four inert ones.
-        #
-        # Addresses would be the wrong key even if they were matched. A port is reusable:
-        # 1-1 was a hub earlier tonight and is a security key now. Trusting a PORT means
-        # authorising a hub and then inheriting that trust for whatever replaces it.
-        remember = sorted({usbinfo.id_of(h) for h in hits if usbinfo.id_of(h)})
-        if done and remember and ipc.append_allow(remember):
-            pid = ipc.holder_pid()
-            p(f"  {C['D']}remembered {' '.join(remember)}"
-              + (f", monitor pid {pid} notified" if pid and pid > 0 else "")
-              + f"{C['N']}")
-        return 0 if done else 1
+    if a.authorize: return do_authorize(a.authorize)
     if a.describe:
         if a.describe is not True:
             return do_describe(a.describe)
@@ -1316,6 +1361,10 @@ def main():
     allow |= ipc.read_allow()
     allow_stamp = [ipc.allow_mtime()]
 
+    # What the keys act on: the devices this session has shown, most recent last, capped
+    # so a single digit picks one. Seeded with what was present, because protections
+    # hold those too and the first thing to allow is often the keyboard you sat down at.
+    recent = []
     shown = 0
     for k, m in sorted(seen.items()):
         if journal is not None:
@@ -1350,7 +1399,10 @@ def main():
                       worst=usbinfo.rules.worst(set(l for l, _, _ in th)) or "none")
         else:
             show_device(m["id"], m["name"], cfg, meta=m, quiet=a.quiet)
+        recent.append({"id": m["id"], "addr": usbinfo.addr_of(m.get("sysfs")),
+                       "name": m.get("name") or ""})
         shown += 1
+    recent[:] = recent[-9:]
     if allow:
         hid = len(seen) - shown
         # Name them. A bare count was the only warning that a device would not be
@@ -1385,13 +1437,48 @@ def main():
 
     # A pinned block below a normal scrolling region, the apt / docker-pull shape.
     # Not a full-screen TUI on purpose: scrollback survives and the log stays copyable.
-    with livemod.Pinned(height=5, enabled=not a.plain) as pin:
+    # Keys are off under --observe on purpose. Nothing is withheld there, so a keyboard
+    # that arrives is live, and whatever it types lands in the focused terminal, which
+    # may well be this one. A single `a` would then let a device admit itself. Under
+    # the gates a device cannot type, and that is the only condition the keys rely on.
+    keys_off = ("--observe: a live keyboard could press them" if a.observe else
+                "--porcelain" if a.porcelain else "--plain" if a.plain else None)
+    with livemod.Pinned(height=6, enabled=not a.plain) as pin, \
+         livemod.Keys(off=keys_off) as kb:
         # Every user-visible line already funnels through emit, so wrapping it once is
         # the whole broadcast layer. Viewers see exactly what the holder's terminal sees.
         emit = ipc.tee(pin.log if pin.enabled else _p, holder, journal)
         last_status = []
+        keyhelp = "a allow  i inspect  h hid  d describe  l list  1-9 pick  ? help"
+        sel = [len(recent) - 1 if recent else None]   # index into recent
+        pending = [None]                              # (spec, label, when) awaiting y
+        from_keys = set()                             # ids allowed here, not elsewhere
 
-        def status(last=""):
+        def picked():
+            i = sel[0]
+            return recent[i] if i is not None and i < len(recent) else None
+
+        def keyrow():
+            if not kb.enabled:
+                return f" {C['D']}keys off: {kb.reason}{C['N']}"
+            if pending[0]:
+                return (f" {C['Y']}allow {pending[0][1]}?{C['N']}  "
+                        f"{C['D']}y confirms, any other key cancels{C['N']}")
+            m = picked()
+            if not m:
+                return f" {C['D']}{keyhelp}{C['N']}"
+            return (f" {C['W']}{m['addr'] or m['id']}{C['N']} {m['name'][:22]:<22} "
+                    f"{C['D']}{keyhelp}{C['N']}")
+
+        last_msg = [""]
+
+        def status(last=None):
+            # The message row keeps what it was told until told otherwise. Every tick
+            # repaints for the uptime and viewer count, and when that repaint passed ""
+            # the row was blank within a second of anything being written on it: the
+            # "last arrival" line went with it, and so would every key's reply.
+            if last is not None: last_msg[0] = last
+            last = last_msg[0]
             gate = (f"{C['G']}WITHHELD{C['N']} " + ", ".join(active)) if active \
                    else f"{C['Y']}GRANTED{C['N']}  drivers bind normally"
             watching = f"   viewers {holder.viewers}" if holder.viewers else ""
@@ -1405,12 +1492,75 @@ def main():
                 f" {C['D']}ctrl-c lifts every protection and puts the kernel back{C['N']}",
             ]
             last_status[:] = lines
-            if pin.enabled: pin.set(lines)
+            # The key row is this terminal's alone. A viewer cannot press them, and its
+            # block is one row shorter, so it gets the status without the row.
+            if pin.enabled: pin.set(lines[:-1] + [keyrow()] + lines[-1:])
             holder.broadcast("status", lines=lines)
         status("waiting for a device")
 
+        def on_key(ch):
+            if pending[0]:
+                m, label, _ = pending[0]
+                pending[0] = None
+                if ch in "yY":
+                    spec = _target(m)
+                    if not spec:
+                        status(f"{m['addr']} no longer holds {m['id']}, nothing allowed"); return
+                    from_keys.add(m["id"])
+                    for ln in _collect(do_authorize, spec): emit(ln)
+                    status(f"allowed {label}")
+                else:
+                    status("allow cancelled")
+                return
+            m = picked()
+            if ch == "?":
+                emit(f"  {C['W']}keys{C['N']}  {C['D']}act on the picked device, shown in the status block{C['N']}")
+                for k, what in (("a", "allow it: admit now, and remember it for a replug"),
+                                ("i", "inspect: full descriptors and the verdicts, again"),
+                                ("h", "hid: what it declares it can send"),
+                                ("d", "describe: every descriptor byte, decoded"),
+                                ("l", "list the devices a digit can pick"),
+                                ("1-9", "pick one of them")):
+                    emit(f"        {C['C']}{k:<4}{C['N']} {C['D']}{what}{C['N']}")
+            elif ch == "l":
+                if not recent:
+                    emit(f"  {C['D']}nothing shown yet{C['N']}"); return
+                for i, r in enumerate(recent):
+                    mark = C["W"] + ">" if i == sel[0] else " "
+                    emit(f"   {mark}{i + 1}{C['N']}  {C['C']}{r['addr'] or '-':<8}{C['N']} "
+                         f"{r['id']}  {r['name']}")
+            elif ch.isdigit() and ch != "0":
+                if int(ch) <= len(recent):
+                    sel[0] = int(ch) - 1
+                    status(f"picked {picked()['id']}")
+                else:
+                    status(f"no device {ch}, l lists them")
+            elif ch in "aihd":
+                if not m:
+                    status("nothing to act on yet"); return
+                spec = _target(m)
+                if not spec:
+                    status(f"{m['addr']} no longer holds {m['id']}, l lists what is here"); return
+                if ch == "a":
+                    if m["id"] in allow:
+                        status(f"{m['id']} is already allowed"); return
+                    pending[0] = (m, f"{spec} {m['name'][:30]}", time.time())
+                    status()
+                elif ch == "i":
+                    full = dict(cfg, monitor=dict(cfg["monitor"], descriptors="full"))
+                    for ln in _collect(do_inspect, full, spec): emit(ln)
+                elif ch == "h":
+                    for ln in _collect(do_hid, spec): emit(ln)
+                elif ch == "d":
+                    for ln in _collect(do_describe, spec): emit(ln)
+            # anything else, including the pieces of an arrow key, is ignored
+
         while True:
-            time.sleep(interval)
+            for ch in kb.wait(interval):
+                on_key(ch)
+            if pending[0] and time.time() - pending[0][2] > 10:
+                pending[0] = None
+                status("allow cancelled, nothing confirmed")
             holder.pump(hello={"ev": "status", "lines": last_status} if last_status else None)
             if reread[0] or ipc.allow_mtime() != allow_stamp[0]:
                 reread[0], allow_stamp[0] = False, ipc.allow_mtime()
@@ -1419,7 +1569,9 @@ def main():
                     allow |= fresh
                     protect.SKIP |= fresh     # so a replug is not withheld again
                     emit(f"  {time.strftime('%H:%M:%S')}  {C['G']}+ allowed{C['N']}  "
-                         f"{' '.join(sorted(fresh))}  {C['D']}another process authorized this{C['N']}")
+                         f"{' '.join(sorted(fresh))}  {C['D']}"
+                         + ("from the keyboard" if fresh <= from_keys
+                            else "another process authorized this") + f"{C['N']}")
                     # Releasing matters as much as exempting. A capture holds the
                     # interface through usbfs and keeps usbhid detached, so a device
                     # allowed while being captured stayed dead: admitted on paper,
@@ -1514,6 +1666,9 @@ def main():
                 # quit. Folding this into the elif chain below would also stop --auto
                 # ever reaching its capture branch.
                 addr0 = usbinfo.addr_of(now[k].get("sysfs"))
+                recent.append({"id": vp0, "addr": addr0, "name": now[k]["name"] or ""})
+                recent[:] = recent[-9:]
+                sel[0] = len(recent) - 1          # a key acts on the newest by default
                 if gating and now[k].get("authorized") == "0":
                     protect.note_withheld(now[k].get("sysfs"))
                 if vp in allow:
@@ -1598,8 +1753,10 @@ def main():
                              f"{C['D']}{vp}{C['N']}  {buf}")
                     typebuf[vp] = ""
             live_txt = "".join(typebuf.values())[-40:]
-            status((f"capturing {len(capturing)}" + (f"   >{live_txt}" if live_txt else ""))
-                   if capturing else "")
+            if capturing:
+                status(f"capturing {len(capturing)}" + (f"   >{live_txt}" if live_txt else ""))
+            else:
+                status("" if last_msg[0].startswith("capturing") else None)
 
 try:
     _rc = main()

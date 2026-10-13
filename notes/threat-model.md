@@ -52,6 +52,13 @@ is what it is looking at, rather than going quiet.)
 **Power anomalies.** Overcurrent, undervoltage, PD negotiation. The kernel occasionally
 logs overcurrent, but by then it has already happened.
 
+**The monitor's own keyboard, under --observe.** The monitor takes single keys, and `a`
+allows a device. Under the gates that is safe: a withheld device cannot type. Under
+`--observe` nothing is withheld, so a keyboard that arrives types into the focused
+terminal, and if that is the monitor it can press `a` and `y` itself. The keys are
+therefore off in that mode. A device you have already allowed is live in every mode, and
+the `y` confirm is what stands between a trusted keyboard and a stray `a`.
+
 ## the operating rule
 
 Software tier first, because it is free and it covers the common case. Treat it as

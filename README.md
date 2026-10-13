@@ -722,7 +722,8 @@ $ sudo ./usbairlock --auto
 `--attach` opens a read-only view of the running monitor. It sees the same arrivals,
 threat lines and captured keystrokes, and it touches nothing: detaching leaves the
 monitor holding. `--authorize` from a third terminal admits a device and the monitor
-picks it up within a tick.
+picks it up within a tick. The monitor's own terminal does not need the third one: `a`
+there is the same `--authorize`, see **keys** below.
 
 ```
 term 1 $ sudo ./usbairlock --auto
@@ -775,6 +776,40 @@ and merely refuses to let the status scroll away. Implemented with the DECSTBM s
 region and about eighty lines in `airlock/live.py`. `--plain` turns it off, and it turns
 itself off when stdout is not a terminal, so piping produces clean text with no escape
 codes.
+
+### keys
+
+The status block's fifth row names the device the monitor last showed, and a single key
+acts on it. No second terminal, no retyping an address:
+
+| key | what it does |
+| --- | --- |
+| `a` | allow it: admit it now and remember it for a replug. Asks for `y` first |
+| `i` | inspect it again, with full descriptors and the verdicts |
+| `h` | what it declares it can send, as `--hid` prints it |
+| `d` | every descriptor byte, decoded, as `--describe` prints it |
+| `l` | list the devices this session has shown, numbered |
+| `1`-`9` | pick one of them instead of the newest |
+| `?` | this list |
+
+`a` runs the same code as `--authorize`, so it writes the shared allow list and a
+viewer sees `+ allowed ... from the keyboard`. The other keys replay the one-shot
+commands through the log, so viewers and `--log` get them too.
+
+Not curses and not a prompt. stdin goes into cbreak between poll ticks (`select` in
+place of the sleep), which delivers a key as it is pressed without echo, and ISIG stays
+on so ctrl-c is still the signal that lifts every protection. The terminal is put back
+on that same signal path, for the reason `Pinned` uses it: `os._exit` skips context
+managers. Keys are off when either end is not a terminal, under `--plain` and
+`--porcelain`, and when the monitor is not the foreground job, since reading a tty from
+the background stops the process.
+
+They are also off under `--observe`, and the status block says so. Nothing is withheld
+there, so a keyboard that arrives is live and types into whatever has focus, which may be
+the monitor. A single `a` would then be a device admitting itself. Under the gates a
+device cannot type, and that is the only thing the keys rely on. Devices you have already
+allowed can type, so the confirm step is there for them: a bare `a` from a trusted
+keyboard resting on a key does nothing.
 
 ## why not udev rules
 
@@ -892,6 +927,7 @@ python3 tests/test_porcelain.py   # every line is a record, and records identify
 python3 tests/test_hidreport.py   # what a device declares it can send, from its descriptor
 python3 tests/test_descriptors.py # the raw descriptor parser that replaced lsusb
 python3 tests/test_release.py     # allowing a device releases it, chords, protections
+python3 tests/test_keys.py        # the monitor's keys, through a pty, and the terminal put back
 ```
 
 No pytest, no dependencies. These exist because the detector had never fired on real
